@@ -103,8 +103,23 @@ function buildPaymentMiddleware(env: Bindings) {
 
 // Apply the payment middleware to /mcp/* routes only.
 app.use("/mcp/*", async (c, next) => {
-  const mw = buildPaymentMiddleware(c.env);
-  return mw(c, next);
+  try {
+    const mw = buildPaymentMiddleware(c.env);
+    return await mw(c, next);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : undefined;
+    console.error("[x402-mw error]", message, stack);
+    return c.json(
+      {
+        error: "x402_middleware_error",
+        message,
+        // Helpful for debugging during bring-up; remove before production traffic.
+        debug_stack: stack?.split("\n").slice(0, 6),
+      },
+      500,
+    );
+  }
 });
 
 // ── Apify MCP gateway proxy ─────────────────────────────────────────────────

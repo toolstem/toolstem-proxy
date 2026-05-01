@@ -1,0 +1,23 @@
+{
+  "name": "toolstem-proxy",
+  "version": "0.1.0",
+  "description": "Toolstem AI-to-AI payment proxy (x402 + Stripe Agent) for MCP servers",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250424.0",
+    "typescript": "^5.7.3",
+    "wrangler": "^3.114.0"
+  },
+  "dependencies": {
+    "hono": "^4.7.1",
+    "@x402/hono": "^2.11.0",
+    "@x402/core": "^2.11.0",
+    "@x402/evm": "^2.11.0"
+  }
+}

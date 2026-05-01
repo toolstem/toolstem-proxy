@@ -1,0 +1,26 @@
+name = "toolstem-proxy"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Custom domain routing for mcp.toolstem.com
+# Created automatically on first deploy. Cloudflare provisions DNS + SSL.
+routes = [
+  { pattern = "mcp.toolstem.com", custom_domain = true }
+]
+
+# Observability — keeps logs in Cloudflare so we can debug agent calls
+[observability]
+enabled = true
+
+# Public, non-secret variables. Secrets (APIFY_TOKEN, PAYTO_ADDRESS) are set
+# via `wrangler secret put` in the deploy workflow — never committed.
+[vars]
+APIFY_GATEWAY = "https://mcp.apify.com"
+DEFAULT_ACTOR = "toolstem/toolstem-mcp-server"
+SEC_ACTOR = "toolstem/toolstem-sec-mcp-server"
+
+# Network: Base mainnet (eip155:8453) for production, Sepolia (eip155:84532) for testing.
+# Start on Sepolia, flip to mainnet once first end-to-end test passes.
+X402_NETWORK = "eip155:84532"
+X402_FACILITATOR = "https://facilitator.x402.org"

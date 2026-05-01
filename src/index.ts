@@ -59,11 +59,17 @@ app.get("/health", (c) => c.json({ ok: true, ts: Date.now() }));
 // ── x402-protected MCP endpoints ────────────────────────────────────────────
 
 /**
- * Build the x402 middleware lazily so it can read env vars per-request.
- * Cloudflare Workers don't have a startup phase like Node, so we attach the
- * middleware inside the request handler.
+ * Build the x402 middleware. We cache the constructed middleware per Worker
+ * isolate so the facilitator handshake only runs on the cold-start request.
+ *
+ * Workers don't have a startup hook, but isolates persist across requests once
+ * warmed, so module-level caching gives us effectively the same behavior.
  */
-function buildPaymentMiddleware(env: Bindings) {
+let cachedMiddleware: ReturnType<typeof paymentMiddleware> | null = null;
+
+async function getPaymentMiddleware(env: Bindings) {
+  if (cachedMiddleware) return cachedMiddleware;
+
   const network = env.X402_NETWORK as `${string}:${string}`;
   const facilitator = new HTTPFacilitatorClient({ url: env.X402_FACILITATOR });
   const resourceServer = new x402ResourceServer(facilitator).register(
@@ -71,7 +77,12 @@ function buildPaymentMiddleware(env: Bindings) {
     new ExactEvmScheme(),
   );
 
-  return paymentMiddleware(
+  // Sync supported schemes/networks from the facilitator before serving traffic.
+  // The middleware passes syncFacilitatorOnStart=true (default) but in Workers
+  // we have to await it explicitly because there is no startup phase.
+  await resourceServer.initialize();
+
+  cachedMiddleware = paymentMiddleware(
     {
       "POST /mcp/finance": {
         accepts: {
@@ -97,14 +108,16 @@ function buildPaymentMiddleware(env: Bindings) {
     resourceServer,
     undefined,
     undefined,
-    false, // don't sync facilitator on start (no startup in Workers)
+    false, // don't sync again — we already initialized above
   );
+
+  return cachedMiddleware;
 }
 
 // Apply the payment middleware to /mcp/* routes only.
 app.use("/mcp/*", async (c, next) => {
   try {
-    const mw = buildPaymentMiddleware(c.env);
+    const mw = await getPaymentMiddleware(c.env);
     return await mw(c, next);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

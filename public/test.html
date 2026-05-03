@@ -213,10 +213,10 @@
         log("✅ Signed.");
 
         // ── 3. Build x-payment header ──────────────────────────────
+        // PaymentPayloadV2Schema requires { x402Version, accepted, payload }
         const payment = {
           x402Version: 2,
-          scheme: "exact",
-          network,
+          accepted: accept,
           payload: {
             signature,
             authorization: message,

@@ -74,7 +74,7 @@ app.use("*", async (c, next) => {
   );
   c.header(
     "Access-Control-Allow-Headers",
-    "Content-Type, X-Payment, mcp-session-id",
+    "Content-Type, X-Payment, Payment-Signature, mcp-session-id",
   );
   c.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 });
@@ -98,7 +98,7 @@ async function getResourceServer(env: Bindings): Promise<x402ResourceServer> {
 
 app.post("/mcp/debug", async (c) => {
   const out: Record<string, unknown> = {};
-  const header = c.req.header("X-Payment") || c.req.header("payment-signature");
+  const header = c.req.header("Payment-Signature") || c.req.header("payment-signature") || c.req.header("X-Payment");
   out.header_present = !!header;
   out.header_length = header?.length ?? 0;
   out.header_preview = header ? header.slice(0, 80) + "…" : null;

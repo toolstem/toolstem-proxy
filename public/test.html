@@ -229,7 +229,7 @@
         try {
           const dbg = await fetch("https://mcp.toolstem.com/mcp/debug", {
             method: "POST",
-            headers: { "Content-Type": "application/json", "X-Payment": xPayment },
+            headers: { "Content-Type": "application/json", "Payment-Signature": xPayment },
             body: "{}",
           });
           const dbgJson = await dbg.json();
@@ -246,7 +246,7 @@
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "X-Payment": xPayment,
+            "Payment-Signature": xPayment,
           },
           body: JSON.stringify({
             jsonrpc: "2.0",

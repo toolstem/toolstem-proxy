@@ -60,6 +60,13 @@
     // We use ethers via CDN to keep the page dependency-free.
     import { BrowserProvider, parseUnits, getBytes, JsonRpcProvider, Contract } from "https://cdn.jsdelivr.net/npm/ethers@6.13.4/+esm";
 
+    // Read endpoint from URL: ?endpoint=sec routes to /mcp/sec
+    const _url = new URL(location.href);
+    const ENDPOINT_PATH = _url.searchParams.get("endpoint") === "sec"
+      ? "/mcp/sec"
+      : "/mcp/finance";
+    document.getElementById("endpoint-display").textContent = ENDPOINT_PATH;
+
     const PROXY = `https://mcp.toolstem.com${ENDPOINT_PATH}`;
     const USDC_SEPOLIA = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
     // Network metadata keyed by EIP-155 chainId.
@@ -79,13 +86,6 @@
         isTestnet: false,
       },
     };
-
-    // Read endpoint from URL: ?endpoint=sec routes to /mcp/sec
-    const url = new URL(location.href);
-    const ENDPOINT_PATH = url.searchParams.get("endpoint") === "sec"
-      ? "/mcp/sec"
-      : "/mcp/finance";
-    document.getElementById("endpoint-display").textContent = ENDPOINT_PATH;
 
     const out = document.getElementById("out");
     const log = (msg, obj) => {

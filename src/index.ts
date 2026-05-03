@@ -21,6 +21,7 @@ import { paymentMiddleware, x402ResourceServer } from "@x402/hono";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
 import { HTTPFacilitatorClient } from "@x402/core/server";
 import { decodePaymentSignatureHeader } from "@x402/core/http";
+import { createFacilitatorConfig } from "@coinbase/x402";
 
 type Bindings = {
   APIFY_TOKEN: string;
@@ -30,7 +31,27 @@ type Bindings = {
   SEC_ACTOR: string;
   X402_NETWORK: string;
   X402_FACILITATOR: string;
+  // CDP facilitator credentials — required for Base mainnet (eip155:8453).
+  // When absent we fall back to X402_FACILITATOR (public x402.org — Sepolia only).
+  CDP_API_KEY_ID?: string;
+  CDP_API_KEY_SECRET?: string;
 };
+
+/**
+ * Build a facilitator client. Routes to CDP when CDP_API_KEY_ID is present
+ * (required for mainnet), otherwise falls back to the public x402.org facilitator
+ * (testnet only). Workers don't expose process.env so we pass keys explicitly.
+ */
+function buildFacilitatorClient(env: Bindings): HTTPFacilitatorClient {
+  if (env.CDP_API_KEY_ID && env.CDP_API_KEY_SECRET) {
+    const cdpConfig = createFacilitatorConfig(
+      env.CDP_API_KEY_ID,
+      env.CDP_API_KEY_SECRET,
+    );
+    return new HTTPFacilitatorClient(cdpConfig);
+  }
+  return new HTTPFacilitatorClient({ url: env.X402_FACILITATOR });
+}
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -86,7 +107,7 @@ let cachedResourceServer: x402ResourceServer | null = null;
 async function getResourceServer(env: Bindings): Promise<x402ResourceServer> {
   if (cachedResourceServer) return cachedResourceServer;
   const network = env.X402_NETWORK as `${string}:${string}`;
-  const facilitator = new HTTPFacilitatorClient({ url: env.X402_FACILITATOR });
+  const facilitator = buildFacilitatorClient(env);
   const rs = new x402ResourceServer(facilitator).register(
     network,
     new ExactEvmScheme(),
@@ -201,7 +222,7 @@ async function getPaymentMiddleware(env: Bindings) {
   if (cachedMiddleware) return cachedMiddleware;
 
   const network = env.X402_NETWORK as `${string}:${string}`;
-  const facilitator = new HTTPFacilitatorClient({ url: env.X402_FACILITATOR });
+  const facilitator = buildFacilitatorClient(env);
   const resourceServer = new x402ResourceServer(facilitator).register(
     network,
     new ExactEvmScheme(),

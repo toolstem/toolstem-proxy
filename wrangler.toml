@@ -17,8 +17,11 @@ DEFAULT_ACTOR = "toolstem/toolstem-mcp-server"
 SEC_ACTOR = "toolstem/toolstem-sec-mcp-server"
 
 # Network: Base mainnet (eip155:8453) for production, Sepolia (eip155:84532) for testing.
-# Start on Sepolia, flip to mainnet once first end-to-end test passes.
-X402_NETWORK = "eip155:84532"
+# Mainnet uses CDP facilitator (requires CDP_API_KEY_ID + CDP_API_KEY_SECRET secrets).
+# Sepolia can use either CDP or the public x402.org facilitator.
+X402_NETWORK = "eip155:8453"
+# X402_FACILITATOR is unused when CDP_API_KEY_ID is present — code routes to CDP automatically.
+# Kept here as a fallback for non-CDP / testnet-only deployments.
 X402_FACILITATOR = "https://www.x402.org/facilitator"
 
 # Static assets (test.html etc.) served from /public.

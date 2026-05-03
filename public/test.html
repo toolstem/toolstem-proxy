@@ -35,11 +35,11 @@
 <body>
 
   <h1>Toolstem x402 End-to-End Test</h1>
-  <p class="sub">Pay $0.01 USDC (Base Sepolia) → get real AAPL data via the Apify-backed MCP proxy.</p>
+  <p class="sub">Pay $0.01 USDC → get real data via the Apify-backed MCP proxy. Network is set by the server challenge.</p>
 
   <div class="step" id="step1">
     <h3>1. Connect wallet</h3>
-    <p id="network-banner">Make sure Coinbase Wallet is on <strong>Base Sepolia</strong> network with some test USDC.</p>
+    <p id="network-banner">Click <em>Connect</em> below — Coinbase Wallet will prompt to switch to the right network (Base mainnet for production, Base Sepolia for testnet).</p>
     <p style="margin-top:8px;font-size:13px;color:#666;">Endpoint: <code id="endpoint-display">/mcp/finance</code> (add <code>?endpoint=sec</code> to URL to test SEC server)</p>
     <button id="btn-connect">Connect Coinbase Wallet</button>
     <div id="addr"></div>

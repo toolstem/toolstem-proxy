@@ -29,6 +29,8 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           PAYTO_ADDRESS: ${{ secrets.PAYTO_ADDRESS }}
+          CDP_API_KEY_ID: ${{ secrets.CDP_API_KEY_ID }}
+          CDP_API_KEY_SECRET: ${{ secrets.CDP_API_KEY_SECRET }}
         run: |
           # Push APIFY_TOKEN as Worker secret (idempotent — overwrites if exists)
           echo "$APIFY_TOKEN" | npx wrangler secret put APIFY_TOKEN
@@ -38,6 +40,13 @@ jobs:
           else
             echo "PAYTO_ADDRESS not set yet — using placeholder. Add the secret once wallet is ready."
             echo "0x0000000000000000000000000000000000000000" | npx wrangler secret put PAYTO_ADDRESS
+          fi
+          # CDP facilitator keys — required for Base mainnet. Optional on Sepolia.
+          if [ -n "$CDP_API_KEY_ID" ]; then
+            echo "$CDP_API_KEY_ID" | npx wrangler secret put CDP_API_KEY_ID
+            echo "$CDP_API_KEY_SECRET" | npx wrangler secret put CDP_API_KEY_SECRET
+          else
+            echo "CDP_API_KEY_ID not set — Worker will use public x402.org facilitator (Sepolia only)."
           fi
 
       - name: Deploy

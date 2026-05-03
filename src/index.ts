@@ -119,25 +119,24 @@ app.post("/mcp/debug", async (c) => {
     return c.json({ ...out, error: "decode_failed" }, 400);
   }
 
-  // Step 2: build the PaymentRequirements that match what the middleware sends
+  // Step 2: build PaymentRequirements the SAME way the real middleware does.
+  // Using rs.buildPaymentRequirements ensures the V2-shape (with `amount`,
+  // not the V1 `maxAmountRequired`) so the facilitator can verify it.
   const network = c.env.X402_NETWORK as `${string}:${string}`;
-  const requirements = {
-    scheme: "exact" as const,
-    network,
-    maxAmountRequired: "10000", // $0.01 USDC = 10000 (6 decimals)
-    asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e", // USDC on Base Sepolia
-    payTo: c.env.PAYTO_ADDRESS,
-    resource: "https://mcp.toolstem.com/mcp/finance",
-    description: "Toolstem Financial Intelligence MCP — one tool call",
-    mimeType: "",
-    maxTimeoutSeconds: 60,
-    extra: { name: "USDC", version: "2" },
-  };
-  out.requirements_used = requirements;
-
-  // Step 3: call the actual verifier and surface whatever it says
   try {
     const rs = await getResourceServer(c.env);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const built = await (rs as any).buildPaymentRequirements({
+      scheme: "exact",
+      price: "$0.01",
+      network,
+      payTo: c.env.PAYTO_ADDRESS,
+      maxTimeoutSeconds: 60,
+    });
+    const requirements = Array.isArray(built) ? built[0] : built;
+    out.requirements_used = requirements;
+
+    // Step 3: call the actual verifier and surface whatever it says
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const verifyResult = await rs.verifyPayment(payload as any, requirements as any);
     out.verify_result = verifyResult;

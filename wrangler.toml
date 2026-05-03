@@ -26,7 +26,10 @@ X402_FACILITATOR = "https://www.x402.org/facilitator"
 directory = "./public"
 binding = "ASSETS"
 not_found_handling = "none"
-run_worker_first = false
+# Worker MUST run first for /mcp/* routes to receive their custom headers
+# (X-Payment, mcp-session-id). With run_worker_first=false, Cloudflare's
+# asset handler intercepts and strips them.
+run_worker_first = ["/mcp/*", "/health"]
 
 # Observability — keeps logs in Cloudflare so we can debug agent calls.
 [observability]

@@ -297,11 +297,17 @@ app.post("/test-pay", async (c) => {
     return c.json(out, 500);
   }
 
-  // Self-call our own protected endpoint. Worker route handles this fine
-  // because Cloudflare allows worker-to-worker fetches over the public host.
+  // Self-call our own protected endpoint. Cloudflare blocks Workers from
+  // fetching their own public hostname (522 origin loop), so we invoke the
+  // Hono app's fetch handler directly with a fabricated Request. This stays
+  // entirely inside the same isolate — no network round trip — which is
+  // also faster and cheaper.
   const target = new URL(c.req.url);
   target.pathname = "/mcp/finance";
   target.search = "";
+
+  const selfFetch = async (req: Request): Promise<Response> =>
+    Promise.resolve(app.fetch(req, c.env, c.executionCtx));
 
   // Minimal MCP initialize body so /mcp/finance has something to forward.
   // We only need the 402 + retry handshake to settle a real on-chain payment;
@@ -320,14 +326,16 @@ app.post("/test-pay", async (c) => {
   // 1. Initial unpaid request — expect 402.
   let firstResp: Response;
   try {
-    firstResp = await fetch(target.toString(), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-      },
-      body: mcpInitBody,
-    });
+    firstResp = await selfFetch(
+      new Request(target.toString(), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        body: mcpInitBody,
+      }),
+    );
   } catch (err) {
     out.first_fetch_error = err instanceof Error ? err.message : String(err);
     return c.json(out, 502);
@@ -374,15 +382,17 @@ app.post("/test-pay", async (c) => {
   // 4. Retry with payment header.
   let secondResp: Response;
   try {
-    secondResp = await fetch(target.toString(), {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-        ...signedHeaders,
-      },
-      body: mcpInitBody,
-    });
+    secondResp = await selfFetch(
+      new Request(target.toString(), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          ...signedHeaders,
+        },
+        body: mcpInitBody,
+      }),
+    );
   } catch (err) {
     out.second_fetch_error = err instanceof Error ? err.message : String(err);
     return c.json(out, 502);

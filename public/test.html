@@ -240,19 +240,29 @@
         }
 
         // ── 4. Re-submit with payment ──────────────────────────────
-        log("→ Submitting paid request…");
+        // We pay for ONE call. To prove the pipe end-to-end we send the MCP
+        // 'initialize' handshake as the paid call — Apify's MCP server will
+        // respond with its server capabilities (proves real data flowed).
+        // tools/call requires a prior initialize + a session id; that needs a
+        // second payment, which we'll wire up once this round succeeds.
+        log("→ Submitting paid request (MCP initialize)…");
         const t0 = performance.now();
         const paid = await fetch(PROXY, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
             "Payment-Signature": xPayment,
           },
           body: JSON.stringify({
             jsonrpc: "2.0",
-            method: "tools/call",
+            method: "initialize",
             id: 1,
-            params: { name: "get_stock_snapshot", arguments: { ticker: "AAPL" } },
+            params: {
+              protocolVersion: "2025-06-18",
+              capabilities: {},
+              clientInfo: { name: "toolstem-test-page", version: "1.0.0" },
+            },
           }),
         });
         const elapsed = (performance.now() - t0).toFixed(0);

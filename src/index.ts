@@ -70,11 +70,11 @@ app.use("*", async (c, next) => {
   c.header("Access-Control-Allow-Origin", "*");
   c.header(
     "Access-Control-Expose-Headers",
-    "payment-required, x-payment-response, x-rejection-reason",
+    "payment-required, x-payment-response, x-rejection-reason, mcp-session-id",
   );
   c.header(
     "Access-Control-Allow-Headers",
-    "Content-Type, X-Payment, Payment-Signature, mcp-session-id",
+    "Content-Type, Accept, X-Payment, Payment-Signature, mcp-session-id",
   );
   c.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 });
@@ -307,10 +307,15 @@ async function proxyToApify(
 
   const body = await request.text();
 
+  // MCP Streamable HTTP requires the client to advertise both content types.
+  const acceptHeader =
+    request.headers.get("accept") ?? "application/json, text/event-stream";
+
   const upstreamReq = new Request(upstream.toString(), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      Accept: acceptHeader,
       Authorization: `Bearer ${env.APIFY_TOKEN}`,
       // Forward MCP session header if present; Apify uses these for stateful sessions.
       ...(request.headers.get("mcp-session-id")

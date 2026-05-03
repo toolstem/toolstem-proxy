@@ -70,7 +70,7 @@ app.use("*", async (c, next) => {
   c.header("Access-Control-Allow-Origin", "*");
   c.header(
     "Access-Control-Expose-Headers",
-    "payment-required, x-payment-response",
+    "payment-required, x-payment-response, x-rejection-reason",
   );
   c.header(
     "Access-Control-Allow-Headers",
@@ -109,7 +109,7 @@ app.post("/mcp/debug", async (c) => {
     return c.json({ ...out, error: "no_payment_header" }, 400);
   }
 
-  // Step 1: try to decode the Base64 JSON
+  // Step 1: decode
   let payload: unknown;
   try {
     payload = decodePaymentSignatureHeader(header);
@@ -120,8 +120,6 @@ app.post("/mcp/debug", async (c) => {
   }
 
   // Step 2: build PaymentRequirements the SAME way the real middleware does.
-  // Using rs.buildPaymentRequirements ensures the V2-shape (with `amount`,
-  // not the V1 `maxAmountRequired`) so the facilitator can verify it.
   const network = c.env.X402_NETWORK as `${string}:${string}`;
   try {
     const rs = await getResourceServer(c.env);
@@ -136,7 +134,47 @@ app.post("/mcp/debug", async (c) => {
     const requirements = Array.isArray(built) ? built[0] : built;
     out.requirements_used = requirements;
 
-    // Step 3: call the actual verifier and surface whatever it says
+    // Step 2b: deep diff vs what the client signed
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const accepted = (payload as any)?.accepted;
+    out.client_accepted = accepted;
+    if (accepted) {
+      const reqJson = JSON.stringify(
+        requirements,
+        Object.keys(requirements as Record<string, unknown>).sort(),
+      );
+      const accJson = JSON.stringify(
+        accepted,
+        Object.keys(accepted).sort(),
+      );
+      out.deep_equal_match = reqJson === accJson;
+      out.req_keys = Object.keys(requirements as Record<string, unknown>).sort();
+      out.acc_keys = Object.keys(accepted).sort();
+      // Field-by-field diff (top level + extra)
+      const fieldDiff: Record<string, { req: unknown; acc: unknown }> = {};
+      const allKeys = new Set([
+        ...Object.keys(requirements as Record<string, unknown>),
+        ...Object.keys(accepted),
+      ]);
+      for (const k of allKeys) {
+        const r = (requirements as Record<string, unknown>)[k];
+        const a = (accepted as Record<string, unknown>)[k];
+        if (JSON.stringify(r) !== JSON.stringify(a)) {
+          fieldDiff[k] = { req: r, acc: a };
+        }
+      }
+      out.field_diff = fieldDiff;
+    }
+
+    // Step 3: try findMatchingRequirements as the real middleware does it
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const match = (rs as any).findMatchingRequirements(
+      [requirements],
+      payload,
+    );
+    out.match_found = !!match;
+
+    // Step 4: call the actual verifier
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const verifyResult = await rs.verifyPayment(payload as any, requirements as any);
     out.verify_result = verifyResult;
@@ -212,7 +250,33 @@ app.use("/mcp/*", async (c, next) => {
   if (c.req.path === "/mcp/debug") return next();
   try {
     const mw = await getPaymentMiddleware(c.env);
-    return await mw(c, next);
+    const result = await mw(c, next);
+    // If the middleware rejected the payment with a 402, decode the
+    // payment-required header and surface the inner `error` field so
+    // we can see exactly why it rejected (e.g. "No matching payment requirements"
+    // vs an invalidReason from the facilitator).
+    if (result instanceof Response && result.status === 402) {
+      const prHeader = result.headers.get("payment-required");
+      if (prHeader) {
+        try {
+          const decoded = JSON.parse(atob(prHeader));
+          // Echo the rejection reason as a custom header so the test page
+          // can read it without parsing the base64 payload itself.
+          const newHeaders = new Headers(result.headers);
+          newHeaders.set(
+            "x-rejection-reason",
+            String((decoded as { error?: string }).error ?? "unknown"),
+          );
+          return new Response(result.body, {
+            status: result.status,
+            headers: newHeaders,
+          });
+        } catch {
+          /* fall through */
+        }
+      }
+    }
+    return result;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const stack = err instanceof Error ? err.stack : undefined;

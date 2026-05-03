@@ -263,6 +263,10 @@
         paid.headers.forEach((v, k) => { allHeaders[k] = v; });
         log("All response headers:", allHeaders);
 
+        // Surface the explicit rejection reason from the worker.
+        const rej = paid.headers.get("x-rejection-reason");
+        if (rej) log("🚫 Rejection reason:", rej);
+
         // If a new payment-required challenge came back, decode it — it usually
         // contains the rejection reason in its 'error' field.
         const newChallenge = paid.headers.get("payment-required");

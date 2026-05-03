@@ -172,9 +172,9 @@
         // Force the wallet to be on Base Sepolia just before signing.
         // Some wallets (Coinbase) silently drop signTypedData if the active
         // chain doesn't match the EIP-712 domain.chainId.
-        const network = await signer.provider.getNetwork();
-        log(`Active chain: ${network.chainId} (expected 84532)`);
-        if (Number(network.chainId) !== 84532) {
+        const activeNet = await signer.provider.getNetwork();
+        log(`Active chain: ${activeNet.chainId} (expected 84532)`);
+        if (Number(activeNet.chainId) !== 84532) {
           log("⚠️ Wrong chain. Switching to Base Sepolia…");
           await window.ethereum.request({
             method: "wallet_switchEthereumChain",

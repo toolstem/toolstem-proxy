@@ -77,7 +77,7 @@ app.use("*", async (c, next) => {
   );
   c.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 });
-app.options("*", (c) => c.text("", 204));
+app.options("*", (c) => new Response(null, { status: 204 }));
 
 // ── x402-protected MCP endpoints ────────────────────────────────────────────
 

@@ -169,8 +169,47 @@
           nonce,
         };
 
+        // Force the wallet to be on Base Sepolia just before signing.
+        // Some wallets (Coinbase) silently drop signTypedData if the active
+        // chain doesn't match the EIP-712 domain.chainId.
+        const network = await signer.provider.getNetwork();
+        log(`Active chain: ${network.chainId} (expected 84532)`);
+        if (Number(network.chainId) !== 84532) {
+          log("⚠️ Wrong chain. Switching to Base Sepolia…");
+          await window.ethereum.request({
+            method: "wallet_switchEthereumChain",
+            params: [{ chainId: BASE_SEPOLIA_CHAIN_HEX }],
+          });
+          log("Re-connecting after switch…");
+          const provider = new BrowserProvider(window.ethereum);
+          signer = await provider.getSigner();
+        }
+
         log("📝 Signing EIP-712 payment authorization…");
-        const signature = await signer.signTypedData(domain, types, message);
+        log("   (If no popup appears, click the Coinbase Wallet extension icon—");
+        log("   the request may be queued there instead of auto-opening.)");
+
+        // Use the lower-level eth_signTypedData_v4 RPC directly. This is more
+        // reliable across Coinbase Wallet, MetaMask, and Rabby than ethers'
+        // signTypedData wrapper, which can mis-serialize some fields.
+        const typedData = {
+          types: {
+            EIP712Domain: [
+              { name: "name", type: "string" },
+              { name: "version", type: "string" },
+              { name: "chainId", type: "uint256" },
+              { name: "verifyingContract", type: "address" },
+            ],
+            ...types,
+          },
+          domain,
+          primaryType: "TransferWithAuthorization",
+          message,
+        };
+        const signature = await window.ethereum.request({
+          method: "eth_signTypedData_v4",
+          params: [signerAddress, JSON.stringify(typedData)],
+        });
         log("✅ Signed.");
 
         // ── 3. Build x-payment header ──────────────────────────────

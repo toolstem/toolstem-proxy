@@ -18,10 +18,13 @@
 
 import { Hono } from "hono";
 import { paymentMiddleware, x402ResourceServer } from "@x402/hono";
-import { ExactEvmScheme } from "@x402/evm/exact/server";
+import { ExactEvmScheme as ExactEvmServerScheme } from "@x402/evm/exact/server";
+import { registerExactEvmScheme } from "@x402/evm/exact/client";
 import { HTTPFacilitatorClient } from "@x402/core/server";
 import { decodePaymentSignatureHeader } from "@x402/core/http";
+import { x402Client, x402HTTPClient } from "@x402/core/client";
 import { createFacilitatorConfig } from "@coinbase/x402";
+import { privateKeyToAccount } from "viem/accounts";
 
 type Bindings = {
   APIFY_TOKEN: string;
@@ -35,6 +38,9 @@ type Bindings = {
   // When absent we fall back to X402_FACILITATOR (public x402.org — Sepolia only).
   CDP_API_KEY_ID?: string;
   CDP_API_KEY_SECRET?: string;
+  // Test-only: private key for a self-custody buyer wallet used by /test-pay.
+  // NEVER reused for anything else; funded with a few USDC for end-to-end smoke tests.
+  TEST_BUYER_PRIVATE_KEY?: string;
 };
 
 /**
@@ -110,7 +116,7 @@ async function getResourceServer(env: Bindings): Promise<x402ResourceServer> {
   const facilitator = buildFacilitatorClient(env);
   const rs = new x402ResourceServer(facilitator).register(
     network,
-    new ExactEvmScheme(),
+    new ExactEvmServerScheme(),
   );
   await rs.initialize();
   cachedResourceServer = rs;
@@ -238,6 +244,169 @@ app.post("/mcp/debug", async (c) => {
   }
 });
 
+// ── /test-pay: server-side end-to-end paid call ─────────────────────
+//
+// Uses a Cloudflare-secret test buyer private key to drive a real x402 paid
+// request against /mcp/finance. Library handles V1 vs V2 payload negotiation
+// and produces the correct shape (EIP-3009 for USDC). Returns the captured
+// settlement TX hash so we can verify mainnet flow end-to-end without a browser
+// wallet, and without hand-rolling EIP-712 signing.
+//
+// Security: TEST_BUYER_PRIVATE_KEY is a one-purpose, low-balance wallet used
+// only for this endpoint. It is never reused. The private key is set via
+// `wrangler secret put` and never appears in logs or responses.
+
+let cachedTestPayClient: x402HTTPClient | null = null;
+
+function buildTestPayClient(env: Bindings): x402HTTPClient {
+  if (cachedTestPayClient) return cachedTestPayClient;
+  if (!env.TEST_BUYER_PRIVATE_KEY) {
+    throw new Error("TEST_BUYER_PRIVATE_KEY not set");
+  }
+  // viem expects 0x-prefixed hex. Tolerate either form on input.
+  const raw = env.TEST_BUYER_PRIVATE_KEY.trim();
+  const pk = (raw.startsWith("0x") ? raw : `0x${raw}`) as `0x${string}`;
+  const signer = privateKeyToAccount(pk);
+  const client = new x402Client();
+  registerExactEvmScheme(client, { signer });
+  cachedTestPayClient = new x402HTTPClient(client);
+  return cachedTestPayClient;
+}
+
+app.post("/test-pay", async (c) => {
+  const out: Record<string, unknown> = {
+    network: c.env.X402_NETWORK,
+    payTo: c.env.PAYTO_ADDRESS,
+    started: new Date().toISOString(),
+  };
+
+  if (!c.env.TEST_BUYER_PRIVATE_KEY) {
+    return c.json({ ...out, error: "TEST_BUYER_PRIVATE_KEY_not_set" }, 500);
+  }
+
+  let httpClient: x402HTTPClient;
+  let buyerAddress: string;
+  try {
+    httpClient = buildTestPayClient(c.env);
+    const raw = c.env.TEST_BUYER_PRIVATE_KEY.trim();
+    const pk = (raw.startsWith("0x") ? raw : `0x${raw}`) as `0x${string}`;
+    buyerAddress = privateKeyToAccount(pk).address;
+    out.buyer_address = buyerAddress;
+  } catch (err) {
+    out.client_init_error = err instanceof Error ? err.message : String(err);
+    return c.json(out, 500);
+  }
+
+  // Self-call our own protected endpoint. Worker route handles this fine
+  // because Cloudflare allows worker-to-worker fetches over the public host.
+  const target = new URL(c.req.url);
+  target.pathname = "/mcp/finance";
+  target.search = "";
+
+  // Minimal MCP initialize body so /mcp/finance has something to forward.
+  // We only need the 402 + retry handshake to settle a real on-chain payment;
+  // the response body is incidental.
+  const mcpInitBody = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "toolstem-test-pay", version: "1.0.0" },
+    },
+  });
+
+  // 1. Initial unpaid request — expect 402.
+  let firstResp: Response;
+  try {
+    firstResp = await fetch(target.toString(), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+      },
+      body: mcpInitBody,
+    });
+  } catch (err) {
+    out.first_fetch_error = err instanceof Error ? err.message : String(err);
+    return c.json(out, 502);
+  }
+  out.first_status = firstResp.status;
+  if (firstResp.status !== 402) {
+    out.first_body = await firstResp.text();
+    out.error = "expected_402_on_first_call";
+    return c.json(out, 500);
+  }
+
+  // 2. Parse 402 → PaymentRequired.
+  let paymentRequired;
+  try {
+    const firstBody = await firstResp.json().catch(() => undefined);
+    paymentRequired = httpClient.getPaymentRequiredResponse(
+      (name: string) => firstResp.headers.get(name),
+      firstBody,
+    );
+    out.payment_required = paymentRequired;
+  } catch (err) {
+    out.parse_pr_error = err instanceof Error ? err.message : String(err);
+    return c.json(out, 500);
+  }
+
+  // 3. Sign payment payload (library picks EIP-3009 for USDC, V2 wrap).
+  let signedHeaders: Record<string, string>;
+  try {
+    const payload = await httpClient.createPaymentPayload(paymentRequired);
+    out.signed_payload_preview = {
+      x402Version: (payload as { x402Version?: number })?.x402Version,
+      scheme: (payload as { scheme?: string })?.scheme,
+      network: (payload as { network?: string })?.network,
+      // Don't dump full signature in response; just confirm shape.
+      payload_keys: Object.keys((payload as { payload?: object })?.payload ?? {}),
+    };
+    signedHeaders = httpClient.encodePaymentSignatureHeader(payload);
+  } catch (err) {
+    out.sign_error = err instanceof Error ? err.message : String(err);
+    out.sign_stack = err instanceof Error ? err.stack?.split("\n").slice(0, 8) : undefined;
+    return c.json(out, 500);
+  }
+
+  // 4. Retry with payment header.
+  let secondResp: Response;
+  try {
+    secondResp = await fetch(target.toString(), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        ...signedHeaders,
+      },
+      body: mcpInitBody,
+    });
+  } catch (err) {
+    out.second_fetch_error = err instanceof Error ? err.message : String(err);
+    return c.json(out, 502);
+  }
+  out.second_status = secondResp.status;
+  out.rejection_reason = secondResp.headers.get("x-rejection-reason");
+
+  // 5. Capture settlement (payment-response or x-payment-response header).
+  try {
+    const settle = httpClient.getPaymentSettleResponse((name: string) =>
+      secondResp.headers.get(name),
+    );
+    out.settle = settle;
+  } catch (err) {
+    out.settle_decode_error = err instanceof Error ? err.message : String(err);
+  }
+
+  const bodyText = await secondResp.text();
+  out.second_body_preview = bodyText.slice(0, 500);
+  out.completed = new Date().toISOString();
+
+  return c.json(out, secondResp.status === 200 ? 200 : 500);
+});
+
 // ── x402-protected MCP endpoints ────────────────────────────────────────────
 
 /**
@@ -256,7 +425,7 @@ async function getPaymentMiddleware(env: Bindings) {
   const facilitator = buildFacilitatorClient(env);
   const resourceServer = new x402ResourceServer(facilitator).register(
     network,
-    new ExactEvmScheme(),
+    new ExactEvmServerScheme(),
   );
 
   // Sync supported schemes/networks from the facilitator before serving traffic.

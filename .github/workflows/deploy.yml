@@ -31,6 +31,7 @@ jobs:
           PAYTO_ADDRESS: ${{ secrets.PAYTO_ADDRESS }}
           CDP_API_KEY_ID: ${{ secrets.CDP_API_KEY_ID }}
           CDP_API_KEY_SECRET: ${{ secrets.CDP_API_KEY_SECRET }}
+          TEST_BUYER_PRIVATE_KEY: ${{ secrets.TEST_BUYER_PRIVATE_KEY }}
         run: |
           # Push APIFY_TOKEN as Worker secret (idempotent — overwrites if exists)
           echo "$APIFY_TOKEN" | npx wrangler secret put APIFY_TOKEN
@@ -47,6 +48,13 @@ jobs:
             echo "$CDP_API_KEY_SECRET" | npx wrangler secret put CDP_API_KEY_SECRET
           else
             echo "CDP_API_KEY_ID not set — Worker will use public x402.org facilitator (Sepolia only)."
+          fi
+          # TEST_BUYER_PRIVATE_KEY: optional. Drives the /test-pay endpoint that
+          # runs a real e2e mainnet payment for smoke testing. Never reused.
+          if [ -n "$TEST_BUYER_PRIVATE_KEY" ]; then
+            echo "$TEST_BUYER_PRIVATE_KEY" | npx wrangler secret put TEST_BUYER_PRIVATE_KEY
+          else
+            echo "TEST_BUYER_PRIVATE_KEY not set — /test-pay endpoint will return 500."
           fi
 
       - name: Deploy

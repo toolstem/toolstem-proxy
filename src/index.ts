@@ -196,9 +196,40 @@ app.post("/mcp/debug", async (c) => {
     out.match_found = !!match;
 
     // Step 4: call the actual verifier
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const verifyResult = await rs.verifyPayment(payload as any, requirements as any);
-    out.verify_result = verifyResult;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const verifyResult = await rs.verifyPayment(payload as any, requirements as any);
+      out.verify_result = verifyResult;
+    } catch (err) {
+      out.verify_throw = err instanceof Error ? err.message : String(err);
+    }
+
+    // Step 4b: call CDP /verify directly (bypass @x402/core truncation) so
+    // we can see the FULL error message CDP returns. This call duplicates what
+    // verifyPayment does internally but lets us read the raw response.
+    if (c.env.CDP_API_KEY_ID && c.env.CDP_API_KEY_SECRET) {
+      try {
+        const { createFacilitatorConfig: mkCfg } = await import("@coinbase/x402");
+        const cfg = mkCfg(c.env.CDP_API_KEY_ID, c.env.CDP_API_KEY_SECRET);
+        const headersFactory = (cfg as { createAuthHeaders?: () => Promise<{ verify: Record<string,string> }> }).createAuthHeaders;
+        const allHeaders = headersFactory ? await headersFactory() : { verify: {} };
+        const verifyHeaders = { ...allHeaders.verify, "Content-Type": "application/json" };
+        const cdpRaw = await fetch(`${cfg.url}/verify`, {
+          method: "POST",
+          headers: verifyHeaders,
+          body: JSON.stringify({
+            paymentPayload: payload,
+            paymentRequirements: requirements,
+          }),
+        });
+        const cdpText = await cdpRaw.text();
+        out.cdp_status = cdpRaw.status;
+        out.cdp_raw_body = cdpText;
+      } catch (err) {
+        out.cdp_probe_error = err instanceof Error ? err.message : String(err);
+      }
+    }
+
     return c.json(out, 200);
   } catch (err) {
     out.verify_error = err instanceof Error ? err.message : String(err);

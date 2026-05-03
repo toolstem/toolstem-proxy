@@ -224,6 +224,21 @@
         };
         const xPayment = btoa(JSON.stringify(payment));
 
+        // 3.5 Diagnostic: ask /mcp/debug what the verifier thinks of this signature.
+        log("→ Running diagnostic against /mcp/debug…");
+        try {
+          const dbg = await fetch("https://mcp.toolstem.com/mcp/debug", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Payment": xPayment },
+            body: "{}",
+          });
+          const dbgJson = await dbg.json();
+          log(`← /mcp/debug HTTP ${dbg.status}`);
+          log("🔬 Diagnostic:", dbgJson);
+        } catch (e) {
+          log("Diagnostic call failed:", e.message || String(e));
+        }
+
         // ── 4. Re-submit with payment ──────────────────────────────
         log("→ Submitting paid request…");
         const t0 = performance.now();

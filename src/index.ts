@@ -20,6 +20,7 @@ import { Hono } from "hono";
 import { paymentMiddleware, x402ResourceServer } from "@x402/hono";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
 import { HTTPFacilitatorClient } from "@x402/core/server";
+import { decodePaymentSignatureHeader } from "@x402/core/http";
 
 type Bindings = {
   APIFY_TOKEN: string;
@@ -78,6 +79,75 @@ app.use("*", async (c, next) => {
   c.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 });
 app.options("*", (c) => new Response(null, { status: 204 }));
+
+// ── DIAGNOSTIC: bypasses paymentMiddleware so we can see the actual rejection reason ──
+// We hold a separate handle to the resourceServer so we can call verifyPayment directly.
+let cachedResourceServer: x402ResourceServer | null = null;
+async function getResourceServer(env: Bindings): Promise<x402ResourceServer> {
+  if (cachedResourceServer) return cachedResourceServer;
+  const network = env.X402_NETWORK as `${string}:${string}`;
+  const facilitator = new HTTPFacilitatorClient({ url: env.X402_FACILITATOR });
+  const rs = new x402ResourceServer(facilitator).register(
+    network,
+    new ExactEvmScheme(),
+  );
+  await rs.initialize();
+  cachedResourceServer = rs;
+  return rs;
+}
+
+app.post("/mcp/debug", async (c) => {
+  const out: Record<string, unknown> = {};
+  const header = c.req.header("X-Payment") || c.req.header("payment-signature");
+  out.header_present = !!header;
+  out.header_length = header?.length ?? 0;
+  out.header_preview = header ? header.slice(0, 80) + "…" : null;
+  out.network = c.env.X402_NETWORK;
+  out.payTo = c.env.PAYTO_ADDRESS;
+
+  if (!header) {
+    return c.json({ ...out, error: "no_payment_header" }, 400);
+  }
+
+  // Step 1: try to decode the Base64 JSON
+  let payload: unknown;
+  try {
+    payload = decodePaymentSignatureHeader(header);
+    out.decoded = payload;
+  } catch (err) {
+    out.decode_error = err instanceof Error ? err.message : String(err);
+    return c.json({ ...out, error: "decode_failed" }, 400);
+  }
+
+  // Step 2: build the PaymentRequirements that match what the middleware sends
+  const network = c.env.X402_NETWORK as `${string}:${string}`;
+  const requirements = {
+    scheme: "exact" as const,
+    network,
+    maxAmountRequired: "10000", // $0.01 USDC = 10000 (6 decimals)
+    asset: "0x036CbD53842c5426634e7929541eC2318f3dCF7e", // USDC on Base Sepolia
+    payTo: c.env.PAYTO_ADDRESS,
+    resource: "https://mcp.toolstem.com/mcp/finance",
+    description: "Toolstem Financial Intelligence MCP — one tool call",
+    mimeType: "",
+    maxTimeoutSeconds: 60,
+    extra: { name: "USDC", version: "2" },
+  };
+  out.requirements_used = requirements;
+
+  // Step 3: call the actual verifier and surface whatever it says
+  try {
+    const rs = await getResourceServer(c.env);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const verifyResult = await rs.verifyPayment(payload as any, requirements as any);
+    out.verify_result = verifyResult;
+    return c.json(out, 200);
+  } catch (err) {
+    out.verify_error = err instanceof Error ? err.message : String(err);
+    out.verify_stack = err instanceof Error ? err.stack?.split("\n").slice(0, 8) : undefined;
+    return c.json(out, 500);
+  }
+});
 
 // ── x402-protected MCP endpoints ────────────────────────────────────────────
 
@@ -138,7 +208,9 @@ async function getPaymentMiddleware(env: Bindings) {
 }
 
 // Apply the payment middleware to /mcp/* routes only.
+// Skip /mcp/debug — that route does its own verification and returns full diagnostics.
 app.use("/mcp/*", async (c, next) => {
+  if (c.req.path === "/mcp/debug") return next();
   try {
     const mw = await getPaymentMiddleware(c.env);
     return await mw(c, next);

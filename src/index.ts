@@ -70,7 +70,7 @@ app.use("*", async (c, next) => {
   c.header("Access-Control-Allow-Origin", "*");
   c.header(
     "Access-Control-Expose-Headers",
-    "payment-required, x-payment-response, x-rejection-reason, mcp-session-id",
+    "payment-required, payment-response, x-payment-response, x-rejection-reason, mcp-session-id",
   );
   c.header(
     "Access-Control-Allow-Headers",

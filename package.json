@@ -11,13 +11,15 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250424.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.7.3",
+    "viem": "^2.48.8",
     "wrangler": "^3.114.0"
   },
   "dependencies": {
-    "hono": "^4.7.1",
-    "@x402/hono": "^2.11.0",
     "@x402/core": "^2.11.0",
-    "@x402/evm": "^2.11.0"
+    "@x402/evm": "^2.11.0",
+    "@x402/hono": "^2.11.0",
+    "hono": "^4.7.1"
   }
 }

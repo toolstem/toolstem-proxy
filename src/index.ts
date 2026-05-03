@@ -56,6 +56,29 @@ app.get("/", (c) =>
 
 app.get("/health", (c) => c.json({ ok: true, ts: Date.now() }));
 
+// In-browser end-to-end test harness is served via Cloudflare Workers Assets
+// binding (configured in wrangler.toml). The Worker auto-serves /test.html
+// from public/. We add a redirect from /test → /test.html for convenience.
+app.get("/test", (c) => c.redirect("/test.html", 302));
+
+// CORS: required so the /test page can call /mcp/* from the same origin.
+// (Same-origin in our case since /test is served from mcp.toolstem.com too,
+// but we add headers anyway for any future cross-origin agent clients.)
+app.use("*", async (c, next) => {
+  await next();
+  c.header("Access-Control-Allow-Origin", "*");
+  c.header(
+    "Access-Control-Expose-Headers",
+    "payment-required, x-payment-response",
+  );
+  c.header(
+    "Access-Control-Allow-Headers",
+    "Content-Type, X-Payment, mcp-session-id",
+  );
+  c.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+});
+app.options("*", (c) => c.text("", 204));
+
 // ── x402-protected MCP endpoints ────────────────────────────────────────────
 
 /**

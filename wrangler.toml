@@ -3,23 +3,11 @@ main = "src/index.ts"
 compatibility_date = "2026-04-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Static assets (test.html etc.) served from /public.
-# Routes that don't match are handled by the Worker (run_worker_first = false).
-[assets]
-directory = "./public"
-binding = "ASSETS"
-not_found_handling = "none"
-run_worker_first = false
-
-# Custom domain routing for mcp.toolstem.com
-# Created automatically on first deploy. Cloudflare provisions DNS + SSL.
+# Custom domain routing for mcp.toolstem.com.
+# Top-level keys must come before any [section] in TOML.
 routes = [
   { pattern = "mcp.toolstem.com", custom_domain = true }
 ]
-
-# Observability — keeps logs in Cloudflare so we can debug agent calls
-[observability]
-enabled = true
 
 # Public, non-secret variables. Secrets (APIFY_TOKEN, PAYTO_ADDRESS) are set
 # via `wrangler secret put` in the deploy workflow — never committed.
@@ -32,3 +20,14 @@ SEC_ACTOR = "toolstem/toolstem-sec-mcp-server"
 # Start on Sepolia, flip to mainnet once first end-to-end test passes.
 X402_NETWORK = "eip155:84532"
 X402_FACILITATOR = "https://www.x402.org/facilitator"
+
+# Static assets (test.html etc.) served from /public.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "none"
+run_worker_first = false
+
+# Observability — keeps logs in Cloudflare so we can debug agent calls.
+[observability]
+enabled = true

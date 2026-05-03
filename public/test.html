@@ -243,6 +243,22 @@
         const elapsed = (performance.now() - t0).toFixed(0);
         log(`← HTTP ${paid.status} in ${elapsed}ms`);
 
+        // Log every response header so we can see rejection reasons.
+        const allHeaders = {};
+        paid.headers.forEach((v, k) => { allHeaders[k] = v; });
+        log("All response headers:", allHeaders);
+
+        // If a new payment-required challenge came back, decode it — it usually
+        // contains the rejection reason in its 'error' field.
+        const newChallenge = paid.headers.get("payment-required");
+        if (newChallenge) {
+          try {
+            log("🔍 Server rejection challenge:", JSON.parse(atob(newChallenge)));
+          } catch (e) {
+            log("Could not decode rejection challenge.");
+          }
+        }
+
         const settlement = paid.headers.get("x-payment-response");
         if (settlement) {
           try { log("📜 Settlement:", JSON.parse(atob(settlement))); }

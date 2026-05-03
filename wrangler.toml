@@ -18,7 +18,7 @@ SEC_ACTOR = "toolstem/toolstem-sec-mcp-server"
 
 # Network: Base mainnet (eip155:8453) for production, Sepolia (eip155:84532) for testing.
 # Start on Sepolia, flip to mainnet once first end-to-end test passes.
-X402_NETWORK = "eip155:8453"
+X402_NETWORK = "eip155:84532"
 X402_FACILITATOR = "https://www.x402.org/facilitator"
 
 # Static assets (test.html etc.) served from /public.

@@ -465,50 +465,69 @@ async function getPaymentMiddleware(env: Bindings) {
         },
         description:
           "Toolstem Financial Intelligence MCP — stock quotes, fundamentals, peers, financial statements. One paid tool call.",
-        // declareDiscoveryExtension serializes the input/output contract the
-        // Bazaar uses to render listings + drive discovery searches. The MCP
-        // variant uses `toolName`; one entry per route is what the discovery
-        // API surfaces today.
+        // The CDP discovery API currently only ingests HTTP-typed Bazaar
+        // entries (?type=mcp returns 0 across the entire catalog as of
+        // 2026-05). The single MCP-server listing that does appear
+        // (api.bitfence.ai/mcp) is declared HTTP body-style. We mirror that
+        // shape: the JSON-RPC envelope is the body schema, and the catalog
+        // gets a working example invocation.
         extensions: {
-          ...declareDiscoveryExtension({
-            toolName: "toolstem-finance",
+          bazaar: {
+            name: "toolstem-finance",
             description:
               "Toolstem Financial Intelligence MCP server. Streamable HTTP transport. Provides stock quotes, fundamentals, peer comparisons, and financial statements via a single paid MCP endpoint.",
-            transport: "streamable-http",
-            inputSchema: {
-              type: "object",
-              properties: {
-                jsonrpc: { type: "string", const: "2.0" },
-                method: {
-                  type: "string",
-                  description: "MCP method (initialize, tools/list, tools/call, …)",
-                },
-                params: { type: "object" },
-                id: { type: ["string", "number"] },
-              },
-              required: ["jsonrpc", "method"],
-            },
-            example: {
-              jsonrpc: "2.0",
-              id: 1,
-              method: "tools/call",
-              params: { name: "get_quote", arguments: { symbol: "AAPL" } },
-            },
-            output: {
-              example: {
+            category: "finance",
+            discoverable: true,
+            ...declareDiscoveryExtension({
+              // method is filled in by enrichDeclaration at request time
+              // (route is "POST /mcp/...") and is omitted from the
+              // DeclareBodyDiscoveryExtensionConfig input type.
+              bodyType: "json",
+              input: {
                 jsonrpc: "2.0",
                 id: 1,
-                result: {
-                  content: [
-                    {
-                      type: "text",
-                      text: '{"symbol":"AAPL","price":228.52,"change":+1.34,"asOf":"2026-05-04"}',
-                    },
-                  ],
+                method: "tools/call",
+                params: { name: "get_quote", arguments: { symbol: "AAPL" } },
+              },
+              inputSchema: {
+                properties: {
+                  jsonrpc: {
+                    type: "string",
+                    description: "JSON-RPC protocol version, must be \"2.0\".",
+                  },
+                  id: {
+                    type: "number",
+                    description: "Client-chosen request id echoed in the response.",
+                  },
+                  method: {
+                    type: "string",
+                    description:
+                      "MCP method — typically \"tools/call\", or \"initialize\"/\"tools/list\" for discovery.",
+                  },
+                  params: {
+                    type: "object",
+                    description:
+                      "MCP method params. For tools/call: { name, arguments }.",
+                  },
+                },
+                required: ["jsonrpc", "method", "id"],
+              },
+              output: {
+                example: {
+                  jsonrpc: "2.0",
+                  id: 1,
+                  result: {
+                    content: [
+                      {
+                        type: "text",
+                        text: '{"symbol":"AAPL","price":228.52,"change":+1.34,"asOf":"2026-05-04"}',
+                      },
+                    ],
+                  },
                 },
               },
-            },
-          }),
+            }).bazaar,
+          },
         },
       },
       "POST /mcp/sec": {
@@ -522,48 +541,65 @@ async function getPaymentMiddleware(env: Bindings) {
         description:
           "Toolstem SEC EDGAR Signal Intelligence MCP — filings, insider transactions, 8-K severity scoring. One paid tool call.",
         extensions: {
-          ...declareDiscoveryExtension({
-            toolName: "toolstem-sec",
+          bazaar: {
+            name: "toolstem-sec",
             description:
               "Toolstem SEC EDGAR Signal Intelligence MCP server. Streamable HTTP transport. Surfaces filings, insider transactions, and 8-K severity scoring via a single paid MCP endpoint.",
-            transport: "streamable-http",
-            inputSchema: {
-              type: "object",
-              properties: {
-                jsonrpc: { type: "string", const: "2.0" },
-                method: {
-                  type: "string",
-                  description: "MCP method (initialize, tools/list, tools/call, …)",
-                },
-                params: { type: "object" },
-                id: { type: ["string", "number"] },
-              },
-              required: ["jsonrpc", "method"],
-            },
-            example: {
-              jsonrpc: "2.0",
-              id: 1,
-              method: "tools/call",
-              params: {
-                name: "get_recent_filings",
-                arguments: { ticker: "AAPL", limit: 5 },
-              },
-            },
-            output: {
-              example: {
+            category: "finance",
+            discoverable: true,
+            ...declareDiscoveryExtension({
+              // method is filled in by enrichDeclaration at request time
+              // (route is "POST /mcp/...") and is omitted from the
+              // DeclareBodyDiscoveryExtensionConfig input type.
+              bodyType: "json",
+              input: {
                 jsonrpc: "2.0",
                 id: 1,
-                result: {
-                  content: [
-                    {
-                      type: "text",
-                      text: '[{"form":"8-K","filedAt":"2026-05-01","severity":"low"}]',
-                    },
-                  ],
+                method: "tools/call",
+                params: {
+                  name: "get_recent_filings",
+                  arguments: { ticker: "AAPL", limit: 5 },
                 },
               },
-            },
-          }),
+              inputSchema: {
+                properties: {
+                  jsonrpc: {
+                    type: "string",
+                    description: "JSON-RPC protocol version, must be \"2.0\".",
+                  },
+                  id: {
+                    type: "number",
+                    description: "Client-chosen request id echoed in the response.",
+                  },
+                  method: {
+                    type: "string",
+                    description:
+                      "MCP method — typically \"tools/call\", or \"initialize\"/\"tools/list\" for discovery.",
+                  },
+                  params: {
+                    type: "object",
+                    description:
+                      "MCP method params. For tools/call: { name, arguments }.",
+                  },
+                },
+                required: ["jsonrpc", "method", "id"],
+              },
+              output: {
+                example: {
+                  jsonrpc: "2.0",
+                  id: 1,
+                  result: {
+                    content: [
+                      {
+                        type: "text",
+                        text: '[{"form":"8-K","filedAt":"2026-05-01","severity":"low"}]',
+                      },
+                    ],
+                  },
+                },
+              },
+            }).bazaar,
+          },
         },
       },
     },

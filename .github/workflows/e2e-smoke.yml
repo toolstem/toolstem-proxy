@@ -14,11 +14,11 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install langchain-toolstem
+      - name: Install dependencies
         run: |
           mkdir -p smoke && cd smoke
           npm init -y
-          npm install langchain-toolstem@latest
+          npm install langchain-toolstem@latest @x402/core @x402/evm viem
 
       - name: Run e2e smoke test
         env:
@@ -26,7 +26,18 @@ jobs:
         run: |
           cd smoke
           node --input-type=module <<'SCRIPT'
-          import { createX402Proxy } from "langchain-toolstem/x402";
+          // Validate langchain-toolstem is importable and exports are present.
+          import { createFinanceTools, createSecTools, createX402Proxy } from "langchain-toolstem";
+          console.log("langchain-toolstem imports OK:", {
+            createFinanceTools: typeof createFinanceTools,
+            createSecTools: typeof createSecTools,
+            createX402Proxy: typeof createX402Proxy,
+          });
+
+          // Use @x402/core client for the actual payment flow (proven against mcp.toolstem.com).
+          import { x402Client, x402HTTPClient } from "@x402/core/client";
+          import { registerExactEvmScheme } from "@x402/evm/exact/client";
+          import { privateKeyToAccount } from "viem/accounts";
 
           const FINANCE_URL = "https://mcp.toolstem.com/mcp/finance";
           const SEC_URL     = "https://mcp.toolstem.com/mcp/sec";
@@ -35,78 +46,117 @@ jobs:
           if (!rawKey) { console.error("Missing TEST_BUYER_PRIVATE_KEY"); process.exit(1); }
           const pk = rawKey.startsWith("0x") ? rawKey : `0x${rawKey}`;
 
-          // Start the local x402 payment-signing proxy.
-          const proxy = await createX402Proxy({
-            privateKey: pk,
-            port: 4021,
-            maxPaymentUsd: 1.0,
-          });
-          console.log(`Proxy started at ${proxy.url}`);
+          const signer = privateKeyToAccount(pk);
+          console.log("Buyer wallet:", signer.address);
 
-          // Helper: make a paid MCP tools/call through the proxy and capture result + tx hash.
-          async function callTool(endpoint, toolName, toolArgs, label) {
-            const proxyUrl = endpoint.replace("https://mcp.toolstem.com", proxy.url);
-            console.log(`\n--- ${label}: calling ${toolName} via ${proxyUrl} ---`);
+          const client = new x402Client();
+          registerExactEvmScheme(client, { signer });
+          const httpClient = new x402HTTPClient(client);
 
-            const res = await fetch(proxyUrl, {
+          async function callEndpoint(url, toolName, toolArgs, label) {
+            console.log(`\n--- ${label}: calling ${toolName} at ${url} ---`);
+
+            const mcpBody = JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "tools/call",
+              params: { name: toolName, arguments: toolArgs },
+            });
+
+            // Step 1: initial request (expect 402).
+            const firstRes = await fetch(url, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
               },
-              body: JSON.stringify({
-                jsonrpc: "2.0",
-                id: 1,
-                method: "tools/call",
-                params: { name: toolName, arguments: toolArgs },
-              }),
+              body: mcpBody,
             });
+            console.log(`${label} first request: HTTP ${firstRes.status}`);
 
-            console.log(`${label} HTTP status: ${res.status}`);
+            if (firstRes.status !== 402) {
+              const body = await firstRes.text();
+              throw new Error(`${label} expected 402, got ${firstRes.status}: ${body.slice(0, 300)}`);
+            }
 
-            // Extract settlement tx hash from x402 payment-response header.
-            const paymentResp = res.headers.get("payment-response")
-              || res.headers.get("x-payment-response");
+            // Step 2: parse 402 payment-required challenge.
+            const firstBody = await firstRes.json().catch(() => undefined);
+            const paymentRequired = httpClient.getPaymentRequiredResponse(
+              (name) => firstRes.headers.get(name),
+              firstBody,
+            );
+            console.log(`${label} payment required, signing...`);
+
+            // Step 3: sign payment payload.
+            const payload = await httpClient.createPaymentPayload(paymentRequired);
+            const signedHeaders = httpClient.encodePaymentSignatureHeader(payload);
+            console.log(`${label} payment signed, retrying with payment header...`);
+
+            // Step 4: retry with signed payment.
+            const secondRes = await fetch(url, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                ...signedHeaders,
+              },
+              body: mcpBody,
+            });
+            console.log(`${label} second request: HTTP ${secondRes.status}`);
+
+            // Step 5: capture settlement tx hash.
             let txHash = null;
-            if (paymentResp) {
-              try {
-                const decoded = JSON.parse(Buffer.from(paymentResp, "base64").toString());
-                txHash = decoded?.transaction?.hash
-                  || decoded?.txHash
-                  || decoded?.transactionHash
-                  || null;
-                // If structured differently, dump the keys for debugging.
-                if (!txHash) {
-                  console.log(`${label} payment-response keys:`, JSON.stringify(Object.keys(decoded)));
-                  console.log(`${label} payment-response full:`, JSON.stringify(decoded).slice(0, 500));
-                }
-              } catch (e) {
-                console.log(`${label} payment-response (raw, first 200):`, paymentResp.slice(0, 200));
+            let settleData = null;
+            try {
+              settleData = httpClient.getPaymentSettleResponse(
+                (name) => secondRes.headers.get(name),
+              );
+              // Traverse the settle structure to find the tx hash.
+              txHash = settleData?.transaction?.hash
+                || settleData?.txHash
+                || settleData?.transactionHash
+                || null;
+              if (!txHash && settleData) {
+                console.log(`${label} settle data:`, JSON.stringify(settleData).slice(0, 500));
+                // Try deeper traversal.
+                const flat = JSON.stringify(settleData);
+                const hashMatch = flat.match(/"(?:hash|txHash|transactionHash)"\s*:\s*"(0x[0-9a-fA-F]{64})"/);
+                if (hashMatch) txHash = hashMatch[1];
               }
-            } else {
-              console.log(`${label} no payment-response header found`);
-              // Dump all response headers for debugging.
-              for (const [k, v] of res.headers.entries()) {
-                console.log(`  ${k}: ${v.slice(0, 120)}`);
+            } catch (e) {
+              console.log(`${label} settle decode error: ${e.message}`);
+              // Try raw header.
+              for (const hdr of ["payment-response", "x-payment-response"]) {
+                const raw = secondRes.headers.get(hdr);
+                if (raw) {
+                  console.log(`${label} ${hdr} (first 200):`, raw.slice(0, 200));
+                  try {
+                    const decoded = JSON.parse(Buffer.from(raw, "base64").toString());
+                    console.log(`${label} ${hdr} decoded:`, JSON.stringify(decoded).slice(0, 500));
+                  } catch {}
+                }
               }
             }
 
-            const body = await res.text();
+            const body = await secondRes.text();
             console.log(`${label} body (first 800 chars): ${body.slice(0, 800)}`);
 
-            if (res.status !== 200) {
-              throw new Error(`${label} failed with HTTP ${res.status}: ${body.slice(0, 300)}`);
+            if (secondRes.status !== 200) {
+              const reason = secondRes.headers.get("x-rejection-reason") || "unknown";
+              throw new Error(`${label} failed: HTTP ${secondRes.status}, reason=${reason}, body=${body.slice(0, 300)}`);
             }
 
             if (txHash) {
               console.log(`\n=== ${label.toUpperCase()} TX HASH: ${txHash} ===`);
+            } else {
+              console.log(`${label} WARNING: no tx hash found in settlement response`);
             }
 
-            return { body, txHash, status: res.status };
+            return { body, txHash, status: secondRes.status };
           }
 
           // --- Finance call ---
-          const finance = await callTool(
+          const finance = await callEndpoint(
             FINANCE_URL,
             "get_stock_snapshot",
             { ticker: "AAPL" },
@@ -114,7 +164,7 @@ jobs:
           );
 
           // --- SEC call ---
-          const sec = await callTool(
+          const sec = await callEndpoint(
             SEC_URL,
             "get_insider_signals",
             { ticker: "AAPL" },
@@ -127,7 +177,5 @@ jobs:
           console.log(`SEC:     HTTP ${sec.status}, tx=${sec.txHash || "N/A"}`);
           console.log("========================================");
 
-          proxy.close();
-          console.log("Proxy closed. Done.");
           process.exit(0);
           SCRIPT

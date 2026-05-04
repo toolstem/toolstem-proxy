@@ -63,7 +63,13 @@ function buildFacilitatorClient(env: Bindings): HTTPFacilitatorClient {
   return new HTTPFacilitatorClient({ url: env.X402_FACILITATOR });
 }
 
-const app = new Hono<{ Bindings: Bindings }>();
+type Variables = {
+  // Set by the /mcp/* middleware when a free discovery method bypasses
+  // payment, so the downstream proxy can read the already-consumed body.
+  mcpFreeBody?: string;
+};
+
+const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
 // ── Public/free endpoints ───────────────────────────────────────────────────
 
@@ -643,10 +649,61 @@ async function getPaymentMiddleware(env: Bindings) {
   return cachedMiddleware;
 }
 
+// MCP discovery and notification methods are free — clients must be able to
+// call `initialize` and `tools/list` without paying, otherwise no standard MCP
+// client (Claude Desktop, mcp-adapters, etc.) can ever reach `tools/call`.
+// Only the methods that actually invoke server-side work are charged.
+//
+// Free:  initialize, tools/list, prompts/list, resources/list, notifications/*
+// Paid:  tools/call, prompts/get, resources/read
+const FREE_MCP_METHODS = new Set([
+  "initialize",
+  "tools/list",
+  "prompts/list",
+  "resources/list",
+]);
+
+function isFreeMcpMethod(method: unknown): boolean {
+  if (typeof method !== "string") return false;
+  if (FREE_MCP_METHODS.has(method)) return true;
+  if (method.startsWith("notifications/")) return true;
+  return false;
+}
+
 // Apply the payment middleware to /mcp/* routes only.
 // Skip /mcp/debug — that route does its own verification and returns full diagnostics.
 app.use("/mcp/*", async (c, next) => {
   if (c.req.path === "/mcp/debug") return next();
+
+  // Non-POST verbs (GET discovery hint, OPTIONS preflight) never carry a
+  // JSON-RPC payload, so they're inherently free. Skip the paid middleware
+  // entirely so the route handler (or CORS/notFound) can respond directly.
+  if (c.req.method !== "POST") return next();
+
+  // Inspect the JSON-RPC body BEFORE running the paid middleware. Discovery
+  // methods skip payment entirely and proxy straight to the upstream MCP
+  // server. We buffer the body once and stash it on the context so the
+  // downstream proxy handler can re-read it without consuming the stream.
+  try {
+    const rawBody = await c.req.raw.clone().text();
+    if (rawBody) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(rawBody);
+      } catch {
+        parsed = undefined;
+      }
+      const method = (parsed as { method?: unknown } | undefined)?.method;
+      if (isFreeMcpMethod(method)) {
+        c.set("mcpFreeBody", rawBody);
+        return next();
+      }
+    }
+  } catch {
+    // If we can't read the body, fall through to the paid path — the
+    // middleware will reject it cleanly.
+  }
+
   try {
     const mw = await getPaymentMiddleware(c.env);
     const result = await mw(c, next);
@@ -698,13 +755,17 @@ async function proxyToApify(
   request: Request,
   env: Bindings,
   actor: string,
+  prebufferedBody?: string,
 ): Promise<Response> {
   // Apify gateway expects: https://mcp.apify.com/?tools=<actor>
   // with Bearer auth.
   const upstream = new URL(env.APIFY_GATEWAY);
   upstream.searchParams.set("tools", actor);
 
-  const body = await request.text();
+  // The free-discovery middleware reads the body to peek at the JSON-RPC
+  // method, which consumes the stream. When that happens it stashes the
+  // bytes for us to reuse here.
+  const body = prebufferedBody ?? (await request.text());
 
   // MCP Streamable HTTP requires the client to advertise both content types.
   const acceptHeader =
@@ -745,11 +806,44 @@ async function proxyToApify(
 }
 
 app.post("/mcp/finance", async (c) =>
-  proxyToApify(c.req.raw, c.env, c.env.DEFAULT_ACTOR),
+  proxyToApify(c.req.raw, c.env, c.env.DEFAULT_ACTOR, c.get("mcpFreeBody")),
 );
 
 app.post("/mcp/sec", async (c) =>
-  proxyToApify(c.req.raw, c.env, c.env.SEC_ACTOR),
+  proxyToApify(c.req.raw, c.env, c.env.SEC_ACTOR, c.get("mcpFreeBody")),
+);
+
+// GET on the MCP routes returns a small discovery hint instead of a 404.
+// Useful for humans / agents that probe the URL with a browser to figure out
+// what the endpoint expects. Streamable HTTP MCP is POST-only, so this is
+// purely informational.
+function buildDiscoveryHint(name: string, slug: string) {
+  return {
+    server: name,
+    protocol: "mcp",
+    version: "2024-11-05",
+    transport: "streamable-http",
+    payment: "x402",
+    price_per_call: "0.01 USDC on Base",
+    docs: `https://toolstem.com/${slug}/`,
+    initialize: "POST with JSON-RPC 2.0 method=initialize",
+    free_methods: [
+      "initialize",
+      "tools/list",
+      "prompts/list",
+      "resources/list",
+      "notifications/*",
+    ],
+    paid_methods: ["tools/call", "prompts/get", "resources/read"],
+  };
+}
+
+app.get("/mcp/finance", (c) =>
+  c.json(buildDiscoveryHint("toolstem-finance", "finance")),
+);
+
+app.get("/mcp/sec", (c) =>
+  c.json(buildDiscoveryHint("toolstem-sec", "sec")),
 );
 
 // ── 404 ─────────────────────────────────────────────────────────────────────

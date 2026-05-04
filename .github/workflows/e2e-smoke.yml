@@ -20,6 +20,40 @@ jobs:
           npm init -y
           npm install langchain-toolstem@latest @x402/core @x402/evm viem x402-fetch @langchain/mcp-adapters @langchain/core
 
+      - name: Phase 0 — Free MCP discovery (no payment)
+        # Verify that initialize / tools/list / GET discovery hint are reachable
+        # WITHOUT any x402 payment header. These must succeed (HTTP 200) so that
+        # standard MCP clients can complete the discovery handshake before a
+        # paid tools/call.
+        run: |
+          set -e
+          for ROUTE in finance sec; do
+            URL="https://mcp.toolstem.com/mcp/${ROUTE}"
+            echo "--- ${ROUTE}: GET discovery hint ---"
+            GET_STATUS=$(curl -s -o /tmp/get.json -w "%{http_code}" "${URL}")
+            cat /tmp/get.json; echo
+            test "${GET_STATUS}" = "200" || { echo "GET ${URL} expected 200, got ${GET_STATUS}"; exit 1; }
+
+            echo "--- ${ROUTE}: POST initialize (no payment) ---"
+            INIT_BODY='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"free-discovery-smoke","version":"1.0.0"}}}'
+            INIT_STATUS=$(curl -s -o /tmp/init.txt -w "%{http_code}" -X POST "${URL}" \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' \
+              --data "${INIT_BODY}")
+            head -c 300 /tmp/init.txt; echo
+            test "${INIT_STATUS}" = "200" || { echo "POST initialize expected 200, got ${INIT_STATUS}"; exit 1; }
+
+            echo "--- ${ROUTE}: POST tools/list (no payment) ---"
+            LIST_BODY='{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+            LIST_STATUS=$(curl -s -o /tmp/list.txt -w "%{http_code}" -X POST "${URL}" \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' \
+              --data "${LIST_BODY}")
+            head -c 300 /tmp/list.txt; echo
+            test "${LIST_STATUS}" = "200" || { echo "POST tools/list expected 200, got ${LIST_STATUS}"; exit 1; }
+          done
+          echo "Phase 0 OK — discovery is free for both routes."
+
       - name: Phase 1 — Low-level JSON-RPC smoke test
         env:
           TEST_BUYER_PRIVATE_KEY: ${{ secrets.TEST_BUYER_PRIVATE_KEY }}

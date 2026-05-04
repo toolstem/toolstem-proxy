@@ -1,0 +1,132 @@
+name: "E2E Smoke: langchain-toolstem"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install langchain-toolstem
+        run: |
+          mkdir -p smoke && cd smoke
+          npm init -y
+          npm install langchain-toolstem@latest
+
+      - name: Run e2e smoke test
+        env:
+          TEST_BUYER_PRIVATE_KEY: ${{ secrets.TEST_BUYER_PRIVATE_KEY }}
+        run: |
+          cd smoke
+          node --input-type=module <<'SCRIPT'
+          import { createX402Proxy } from "langchain-toolstem/x402";
+
+          const FINANCE_URL = "https://mcp.toolstem.com/mcp/finance";
+          const SEC_URL     = "https://mcp.toolstem.com/mcp/sec";
+
+          const pk = process.env.TEST_BUYER_PRIVATE_KEY;
+          if (!pk) { console.error("Missing TEST_BUYER_PRIVATE_KEY"); process.exit(1); }
+
+          // Start the local x402 payment-signing proxy.
+          const proxy = await createX402Proxy({
+            privateKey: pk,
+            port: 4021,
+            maxPaymentUsd: 1.0,
+          });
+          console.log(`Proxy started at ${proxy.url}`);
+
+          // Helper: make a paid MCP tools/call through the proxy and capture result + tx hash.
+          async function callTool(endpoint, toolName, toolArgs, label) {
+            const proxyUrl = endpoint.replace("https://mcp.toolstem.com", proxy.url);
+            console.log(`\n--- ${label}: calling ${toolName} via ${proxyUrl} ---`);
+
+            const res = await fetch(proxyUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+              },
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "tools/call",
+                params: { name: toolName, arguments: toolArgs },
+              }),
+            });
+
+            console.log(`${label} HTTP status: ${res.status}`);
+
+            // Extract settlement tx hash from x402 payment-response header.
+            const paymentResp = res.headers.get("payment-response")
+              || res.headers.get("x-payment-response");
+            let txHash = null;
+            if (paymentResp) {
+              try {
+                const decoded = JSON.parse(Buffer.from(paymentResp, "base64").toString());
+                txHash = decoded?.transaction?.hash
+                  || decoded?.txHash
+                  || decoded?.transactionHash
+                  || null;
+                // If structured differently, dump the keys for debugging.
+                if (!txHash) {
+                  console.log(`${label} payment-response keys:`, JSON.stringify(Object.keys(decoded)));
+                  console.log(`${label} payment-response full:`, JSON.stringify(decoded).slice(0, 500));
+                }
+              } catch (e) {
+                console.log(`${label} payment-response (raw, first 200):`, paymentResp.slice(0, 200));
+              }
+            } else {
+              console.log(`${label} no payment-response header found`);
+              // Dump all response headers for debugging.
+              for (const [k, v] of res.headers.entries()) {
+                console.log(`  ${k}: ${v.slice(0, 120)}`);
+              }
+            }
+
+            const body = await res.text();
+            console.log(`${label} body (first 800 chars): ${body.slice(0, 800)}`);
+
+            if (res.status !== 200) {
+              throw new Error(`${label} failed with HTTP ${res.status}: ${body.slice(0, 300)}`);
+            }
+
+            if (txHash) {
+              console.log(`\n=== ${label.toUpperCase()} TX HASH: ${txHash} ===`);
+            }
+
+            return { body, txHash, status: res.status };
+          }
+
+          // --- Finance call ---
+          const finance = await callTool(
+            FINANCE_URL,
+            "get_stock_snapshot",
+            { ticker: "AAPL" },
+            "FINANCE"
+          );
+
+          // --- SEC call ---
+          const sec = await callTool(
+            SEC_URL,
+            "get_insider_signals",
+            { ticker: "AAPL" },
+            "SEC"
+          );
+
+          // Summary
+          console.log("\n========== SMOKE TEST SUMMARY ==========");
+          console.log(`FINANCE: HTTP ${finance.status}, tx=${finance.txHash || "N/A"}`);
+          console.log(`SEC:     HTTP ${sec.status}, tx=${sec.txHash || "N/A"}`);
+          console.log("========================================");
+
+          proxy.close();
+          console.log("Proxy closed. Done.");
+          process.exit(0);
+          SCRIPT

@@ -31,8 +31,9 @@ jobs:
           const FINANCE_URL = "https://mcp.toolstem.com/mcp/finance";
           const SEC_URL     = "https://mcp.toolstem.com/mcp/sec";
 
-          const pk = process.env.TEST_BUYER_PRIVATE_KEY;
-          if (!pk) { console.error("Missing TEST_BUYER_PRIVATE_KEY"); process.exit(1); }
+          const rawKey = (process.env.TEST_BUYER_PRIVATE_KEY || "").trim();
+          if (!rawKey) { console.error("Missing TEST_BUYER_PRIVATE_KEY"); process.exit(1); }
+          const pk = rawKey.startsWith("0x") ? rawKey : `0x${rawKey}`;
 
           // Start the local x402 payment-signing proxy.
           const proxy = await createX402Proxy({

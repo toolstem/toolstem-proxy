@@ -279,12 +279,42 @@ function buildTestPayClient(env: Bindings): x402HTTPClient {
   return cachedTestPayClient;
 }
 
+const TEST_PAY_ROUTES = {
+  finance: "/mcp/finance",
+  sec: "/mcp/sec",
+} as const;
+type TestPayRoute = keyof typeof TEST_PAY_ROUTES;
+
 app.post("/test-pay", async (c) => {
   const out: Record<string, unknown> = {
     network: c.env.X402_NETWORK,
     payTo: c.env.PAYTO_ADDRESS,
     started: new Date().toISOString(),
   };
+
+  // Resolve which MCP route to exercise. Query param wins; JSON body field is
+  // accepted for symmetry. Default preserves the original /test-pay behavior.
+  let routeRaw: string | undefined = c.req.query("route");
+  if (!routeRaw) {
+    const bodyJson = await c.req.json().catch(() => undefined);
+    if (bodyJson && typeof bodyJson === "object" && "route" in bodyJson) {
+      const v = (bodyJson as { route?: unknown }).route;
+      if (typeof v === "string") routeRaw = v;
+    }
+  }
+  const route = (routeRaw ?? "finance") as TestPayRoute;
+  if (!(route in TEST_PAY_ROUTES)) {
+    return c.json(
+      {
+        ...out,
+        error: "invalid_route",
+        message: `route must be one of ${Object.keys(TEST_PAY_ROUTES).join(", ")}`,
+        received: routeRaw,
+      },
+      400,
+    );
+  }
+  out.route = route;
 
   if (!c.env.TEST_BUYER_PRIVATE_KEY) {
     return c.json({ ...out, error: "TEST_BUYER_PRIVATE_KEY_not_set" }, 500);
@@ -309,8 +339,9 @@ app.post("/test-pay", async (c) => {
   // entirely inside the same isolate — no network round trip — which is
   // also faster and cheaper.
   const target = new URL(c.req.url);
-  target.pathname = "/mcp/finance";
+  target.pathname = TEST_PAY_ROUTES[route];
   target.search = "";
+  out.target_url = target.toString();
 
   const selfFetch = async (req: Request): Promise<Response> =>
     Promise.resolve(app.fetch(req, c.env, c.executionCtx));

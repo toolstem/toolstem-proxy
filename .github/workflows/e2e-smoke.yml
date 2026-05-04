@@ -53,30 +53,18 @@ jobs:
           registerExactEvmScheme(client, { signer });
           const httpClient = new x402HTTPClient(client);
 
-          async function callEndpoint(url, toolName, toolArgs, label) {
-            console.log(`\n--- ${label}: calling ${toolName} at ${url} ---`);
-
-            const mcpBody = JSON.stringify({
-              jsonrpc: "2.0",
-              id: 1,
-              method: "tools/call",
-              params: { name: toolName, arguments: toolArgs },
-            });
+          // Make a paid request: handles 402 challenge -> sign -> retry.
+          async function paidFetch(url, body, extraHeaders = {}) {
+            const headers = {
+              "Content-Type": "application/json",
+              "Accept": "application/json, text/event-stream",
+              ...extraHeaders,
+            };
 
             // Step 1: initial request (expect 402).
-            const firstRes = await fetch(url, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-              },
-              body: mcpBody,
-            });
-            console.log(`${label} first request: HTTP ${firstRes.status}`);
-
+            const firstRes = await fetch(url, { method: "POST", headers, body });
             if (firstRes.status !== 402) {
-              const body = await firstRes.text();
-              throw new Error(`${label} expected 402, got ${firstRes.status}: ${body.slice(0, 300)}`);
+              return firstRes;
             }
 
             // Step 2: parse 402 payment-required challenge.
@@ -85,78 +73,115 @@ jobs:
               (name) => firstRes.headers.get(name),
               firstBody,
             );
-            console.log(`${label} payment required, signing...`);
 
             // Step 3: sign payment payload.
             const payload = await httpClient.createPaymentPayload(paymentRequired);
             const signedHeaders = httpClient.encodePaymentSignatureHeader(payload);
-            console.log(`${label} payment signed, retrying with payment header...`);
 
             // Step 4: retry with signed payment.
-            const secondRes = await fetch(url, {
+            return fetch(url, {
               method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-                ...signedHeaders,
-              },
-              body: mcpBody,
+              headers: { ...headers, ...signedHeaders },
+              body,
             });
-            console.log(`${label} second request: HTTP ${secondRes.status}`);
+          }
 
-            // Step 5: capture settlement tx hash.
+          // Extract settlement tx hash from response.
+          function extractTxHash(res, label) {
             let txHash = null;
-            let settleData = null;
             try {
-              settleData = httpClient.getPaymentSettleResponse(
-                (name) => secondRes.headers.get(name),
+              const settleData = httpClient.getPaymentSettleResponse(
+                (name) => res.headers.get(name),
               );
-              // Traverse the settle structure to find the tx hash.
               txHash = settleData?.transaction?.hash
                 || settleData?.txHash
                 || settleData?.transactionHash
                 || null;
               if (!txHash && settleData) {
                 console.log(`${label} settle data:`, JSON.stringify(settleData).slice(0, 500));
-                // Try deeper traversal.
                 const flat = JSON.stringify(settleData);
-                const hashMatch = flat.match(/"(?:hash|txHash|transactionHash)"\s*:\s*"(0x[0-9a-fA-F]{64})"/);
-                if (hashMatch) txHash = hashMatch[1];
+                const m = flat.match(/"(?:hash|txHash|transactionHash)"\s*:\s*"(0x[0-9a-fA-F]{64})"/);
+                if (m) txHash = m[1];
               }
             } catch (e) {
-              console.log(`${label} settle decode error: ${e.message}`);
-              // Try raw header.
+              console.log(`${label} settle decode: ${e.message}`);
+              // Try raw headers.
               for (const hdr of ["payment-response", "x-payment-response"]) {
-                const raw = secondRes.headers.get(hdr);
+                const raw = res.headers.get(hdr);
                 if (raw) {
-                  console.log(`${label} ${hdr} (first 200):`, raw.slice(0, 200));
+                  console.log(`${label} ${hdr} (first 300):`, raw.slice(0, 300));
                   try {
                     const decoded = JSON.parse(Buffer.from(raw, "base64").toString());
-                    console.log(`${label} ${hdr} decoded:`, JSON.stringify(decoded).slice(0, 500));
+                    console.log(`${label} decoded:`, JSON.stringify(decoded).slice(0, 500));
                   } catch {}
                 }
               }
             }
+            return txHash;
+          }
 
-            const body = await secondRes.text();
-            console.log(`${label} body (first 800 chars): ${body.slice(0, 800)}`);
+          // ── Test one endpoint: initialize session, then call a tool ──
+          async function testEndpoint(url, toolName, toolArgs, label) {
+            console.log(`\n--- ${label}: testing ${url} ---`);
 
-            if (secondRes.status !== 200) {
-              const reason = secondRes.headers.get("x-rejection-reason") || "unknown";
-              throw new Error(`${label} failed: HTTP ${secondRes.status}, reason=${reason}, body=${body.slice(0, 300)}`);
+            // Phase 1: MCP initialize (paid).
+            const initBody = JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "initialize",
+              params: {
+                protocolVersion: "2025-03-26",
+                capabilities: {},
+                clientInfo: { name: "e2e-smoke", version: "1.0.0" },
+              },
+            });
+
+            const initRes = await paidFetch(url, initBody);
+            console.log(`${label} initialize: HTTP ${initRes.status}`);
+            const initTxHash = extractTxHash(initRes, `${label}/init`);
+
+            const sessionId = initRes.headers.get("mcp-session-id");
+            const initText = await initRes.text();
+            console.log(`${label} session: ${sessionId || "none"}`);
+            console.log(`${label} init body: ${initText.slice(0, 300)}`);
+
+            if (initRes.status !== 200) {
+              throw new Error(`${label} initialize failed: HTTP ${initRes.status}`);
             }
 
+            // Phase 2: MCP tools/call (paid, with session ID).
+            const callBody = JSON.stringify({
+              jsonrpc: "2.0",
+              id: 2,
+              method: "tools/call",
+              params: { name: toolName, arguments: toolArgs },
+            });
+
+            const sessionHeaders = sessionId ? { "mcp-session-id": sessionId } : {};
+            const callRes = await paidFetch(url, callBody, sessionHeaders);
+            console.log(`${label} tools/call: HTTP ${callRes.status}`);
+            const callTxHash = extractTxHash(callRes, `${label}/call`);
+
+            const callText = await callRes.text();
+            console.log(`${label} call body (first 800): ${callText.slice(0, 800)}`);
+
+            if (callRes.status !== 200) {
+              throw new Error(`${label} tools/call failed: HTTP ${callRes.status}: ${callText.slice(0, 300)}`);
+            }
+
+            // Use whichever tx hash we got (call or init).
+            const txHash = callTxHash || initTxHash;
             if (txHash) {
               console.log(`\n=== ${label.toUpperCase()} TX HASH: ${txHash} ===`);
             } else {
-              console.log(`${label} WARNING: no tx hash found in settlement response`);
+              console.log(`${label} WARNING: no tx hash captured`);
             }
 
-            return { body, txHash, status: secondRes.status };
+            return { body: callText, txHash, initTxHash, callTxHash };
           }
 
           // --- Finance call ---
-          const finance = await callEndpoint(
+          const finance = await testEndpoint(
             FINANCE_URL,
             "get_stock_snapshot",
             { ticker: "AAPL" },
@@ -164,7 +189,7 @@ jobs:
           );
 
           // --- SEC call ---
-          const sec = await callEndpoint(
+          const sec = await testEndpoint(
             SEC_URL,
             "get_insider_signals",
             { ticker: "AAPL" },
@@ -173,8 +198,8 @@ jobs:
 
           // Summary
           console.log("\n========== SMOKE TEST SUMMARY ==========");
-          console.log(`FINANCE: HTTP ${finance.status}, tx=${finance.txHash || "N/A"}`);
-          console.log(`SEC:     HTTP ${sec.status}, tx=${sec.txHash || "N/A"}`);
+          console.log(`FINANCE: tx=${finance.txHash || finance.initTxHash || "N/A"}`);
+          console.log(`SEC:     tx=${sec.txHash || sec.initTxHash || "N/A"}`);
           console.log("========================================");
 
           process.exit(0);

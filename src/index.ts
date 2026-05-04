@@ -23,6 +23,10 @@ import { registerExactEvmScheme } from "@x402/evm/exact/client";
 import { HTTPFacilitatorClient } from "@x402/core/server";
 import { decodePaymentSignatureHeader } from "@x402/core/http";
 import { x402Client, x402HTTPClient } from "@x402/core/client";
+import {
+  bazaarResourceServerExtension,
+  declareDiscoveryExtension,
+} from "@x402/extensions/bazaar";
 import { createFacilitatorConfig } from "@coinbase/x402";
 import { privateKeyToAccount } from "viem/accounts";
 
@@ -114,10 +118,12 @@ async function getResourceServer(env: Bindings): Promise<x402ResourceServer> {
   if (cachedResourceServer) return cachedResourceServer;
   const network = env.X402_NETWORK as `${string}:${string}`;
   const facilitator = buildFacilitatorClient(env);
-  const rs = new x402ResourceServer(facilitator).register(
-    network,
-    new ExactEvmServerScheme(),
-  );
+  // registerExtension(bazaarResourceServerExtension) — without this the
+  // resource server will not surface the bazaar discovery extension to the
+  // facilitator on /verify, so cataloging never happens.
+  const rs = new x402ResourceServer(facilitator)
+    .register(network, new ExactEvmServerScheme())
+    .registerExtension(bazaarResourceServerExtension);
   await rs.initialize();
   cachedResourceServer = rs;
   return rs;
@@ -433,10 +439,14 @@ async function getPaymentMiddleware(env: Bindings) {
 
   const network = env.X402_NETWORK as `${string}:${string}`;
   const facilitator = buildFacilitatorClient(env);
-  const resourceServer = new x402ResourceServer(facilitator).register(
-    network,
-    new ExactEvmServerScheme(),
-  );
+  // registerExtension(bazaarResourceServerExtension) wires the per-route
+  // `extensions.bazaar` declarations (below) into the /verify call so the
+  // facilitator catalogs us in the Bazaar discovery API. Without it, our
+  // declared metadata is dropped and we never appear in
+  // https://api.cdp.coinbase.com/platform/v2/x402/discovery/resources.
+  const resourceServer = new x402ResourceServer(facilitator)
+    .register(network, new ExactEvmServerScheme())
+    .registerExtension(bazaarResourceServerExtension);
 
   // Sync supported schemes/networks from the facilitator before serving traffic.
   // The middleware passes syncFacilitatorOnStart=true (default) but in Workers
@@ -453,7 +463,53 @@ async function getPaymentMiddleware(env: Bindings) {
           payTo: env.PAYTO_ADDRESS,
           maxTimeoutSeconds: 60,
         },
-        description: "Toolstem Financial Intelligence MCP — one tool call",
+        description:
+          "Toolstem Financial Intelligence MCP — stock quotes, fundamentals, peers, financial statements. One paid tool call.",
+        // declareDiscoveryExtension serializes the input/output contract the
+        // Bazaar uses to render listings + drive discovery searches. The MCP
+        // variant uses `toolName`; one entry per route is what the discovery
+        // API surfaces today.
+        extensions: {
+          ...declareDiscoveryExtension({
+            toolName: "toolstem-finance",
+            description:
+              "Toolstem Financial Intelligence MCP server. Streamable HTTP transport. Provides stock quotes, fundamentals, peer comparisons, and financial statements via a single paid MCP endpoint.",
+            transport: "streamable-http",
+            inputSchema: {
+              type: "object",
+              properties: {
+                jsonrpc: { type: "string", const: "2.0" },
+                method: {
+                  type: "string",
+                  description: "MCP method (initialize, tools/list, tools/call, …)",
+                },
+                params: { type: "object" },
+                id: { type: ["string", "number"] },
+              },
+              required: ["jsonrpc", "method"],
+            },
+            example: {
+              jsonrpc: "2.0",
+              id: 1,
+              method: "tools/call",
+              params: { name: "get_quote", arguments: { symbol: "AAPL" } },
+            },
+            output: {
+              example: {
+                jsonrpc: "2.0",
+                id: 1,
+                result: {
+                  content: [
+                    {
+                      type: "text",
+                      text: '{"symbol":"AAPL","price":228.52,"change":+1.34,"asOf":"2026-05-04"}',
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+        },
       },
       "POST /mcp/sec": {
         accepts: {
@@ -463,7 +519,52 @@ async function getPaymentMiddleware(env: Bindings) {
           payTo: env.PAYTO_ADDRESS,
           maxTimeoutSeconds: 60,
         },
-        description: "Toolstem SEC EDGAR Signal Intelligence MCP — one tool call",
+        description:
+          "Toolstem SEC EDGAR Signal Intelligence MCP — filings, insider transactions, 8-K severity scoring. One paid tool call.",
+        extensions: {
+          ...declareDiscoveryExtension({
+            toolName: "toolstem-sec",
+            description:
+              "Toolstem SEC EDGAR Signal Intelligence MCP server. Streamable HTTP transport. Surfaces filings, insider transactions, and 8-K severity scoring via a single paid MCP endpoint.",
+            transport: "streamable-http",
+            inputSchema: {
+              type: "object",
+              properties: {
+                jsonrpc: { type: "string", const: "2.0" },
+                method: {
+                  type: "string",
+                  description: "MCP method (initialize, tools/list, tools/call, …)",
+                },
+                params: { type: "object" },
+                id: { type: ["string", "number"] },
+              },
+              required: ["jsonrpc", "method"],
+            },
+            example: {
+              jsonrpc: "2.0",
+              id: 1,
+              method: "tools/call",
+              params: {
+                name: "get_recent_filings",
+                arguments: { ticker: "AAPL", limit: 5 },
+              },
+            },
+            output: {
+              example: {
+                jsonrpc: "2.0",
+                id: 1,
+                result: {
+                  content: [
+                    {
+                      type: "text",
+                      text: '[{"form":"8-K","filedAt":"2026-05-01","severity":"low"}]',
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+        },
       },
     },
     resourceServer,

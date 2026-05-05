@@ -27,6 +27,10 @@ jobs:
         # paid tools/call.
         run: |
           set -e
+          # Expected synthesized tool surface (must match src/tool-defs.ts).
+          FINANCE_EXPECTED="compare_companies get_company_metrics get_stock_snapshot"
+          SEC_EXPECTED="compare_disclosure_signals get_company_filings_summary get_insider_signal get_institutional_signal get_material_events_digest"
+
           for ROUTE in finance sec; do
             URL="https://mcp.toolstem.com/mcp/${ROUTE}"
             echo "--- ${ROUTE}: GET discovery hint ---"
@@ -34,25 +38,64 @@ jobs:
             cat /tmp/get.json; echo
             test "${GET_STATUS}" = "200" || { echo "GET ${URL} expected 200, got ${GET_STATUS}"; exit 1; }
 
+            # GET discovery hint must include the synthesized tool names.
+            if [ "${ROUTE}" = "finance" ]; then
+              EXPECTED="${FINANCE_EXPECTED}"
+            else
+              EXPECTED="${SEC_EXPECTED}"
+            fi
+            for TOOL in ${EXPECTED}; do
+              grep -q "\"${TOOL}\"" /tmp/get.json || { echo "GET hint missing tool: ${TOOL}"; cat /tmp/get.json; exit 1; }
+            done
+
             echo "--- ${ROUTE}: POST initialize (no payment) ---"
             INIT_BODY='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"free-discovery-smoke","version":"1.0.0"}}}'
-            INIT_STATUS=$(curl -s -o /tmp/init.txt -w "%{http_code}" -X POST "${URL}" \
+            INIT_STATUS=$(curl -s -o /tmp/init.txt -w "%{http_code}" -D /tmp/init.headers -X POST "${URL}" \
               -H 'Content-Type: application/json' \
               -H 'Accept: application/json, text/event-stream' \
               --data "${INIT_BODY}")
             head -c 300 /tmp/init.txt; echo
             test "${INIT_STATUS}" = "200" || { echo "POST initialize expected 200, got ${INIT_STATUS}"; exit 1; }
 
+            # Carry the session id forward — Apify requires it for tools/list.
+            SESSION_ID=$(grep -i '^mcp-session-id:' /tmp/init.headers | head -n1 | awk '{print $2}' | tr -d '\r\n')
+
             echo "--- ${ROUTE}: POST tools/list (no payment) ---"
             LIST_BODY='{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
-            LIST_STATUS=$(curl -s -o /tmp/list.txt -w "%{http_code}" -X POST "${URL}" \
-              -H 'Content-Type: application/json' \
-              -H 'Accept: application/json, text/event-stream' \
-              --data "${LIST_BODY}")
-            head -c 300 /tmp/list.txt; echo
+            if [ -n "${SESSION_ID}" ]; then
+              LIST_STATUS=$(curl -s -o /tmp/list.txt -w "%{http_code}" -X POST "${URL}" \
+                -H 'Content-Type: application/json' \
+                -H 'Accept: application/json, text/event-stream' \
+                -H "mcp-session-id: ${SESSION_ID}" \
+                --data "${LIST_BODY}")
+            else
+              LIST_STATUS=$(curl -s -o /tmp/list.txt -w "%{http_code}" -X POST "${URL}" \
+                -H 'Content-Type: application/json' \
+                -H 'Accept: application/json, text/event-stream' \
+                --data "${LIST_BODY}")
+            fi
+            echo "tools/list response (first 600 chars):"
+            head -c 600 /tmp/list.txt; echo
             test "${LIST_STATUS}" = "200" || { echo "POST tools/list expected 200, got ${LIST_STATUS}"; exit 1; }
+
+            # Assert the synthesized surface: each expected tool must appear,
+            # and the upstream wrapper / get-actor-output must NOT.
+            for TOOL in ${EXPECTED}; do
+              grep -q "\"name\":\"${TOOL}\"\\|\"name\": \"${TOOL}\"" /tmp/list.txt || {
+                echo "tools/list missing synthesized tool: ${TOOL}";
+                cat /tmp/list.txt;
+                exit 1;
+              }
+            done
+            for FORBIDDEN in "toolstem--toolstem-mcp-server" "toolstem--toolstem-sec-mcp-server" "get-actor-output"; do
+              if grep -q "\"name\":\"${FORBIDDEN}\"\\|\"name\": \"${FORBIDDEN}\"" /tmp/list.txt; then
+                echo "tools/list still exposes upstream tool: ${FORBIDDEN}"
+                cat /tmp/list.txt
+                exit 1
+              fi
+            done
           done
-          echo "Phase 0 OK — discovery is free for both routes."
+          echo "Phase 0 OK — discovery is free, and tools/list returns the synthesized surface for both routes."
 
       - name: Phase 1 — Low-level JSON-RPC smoke test
         env:
@@ -215,18 +258,23 @@ jobs:
           }
 
           // --- Finance call ---
+          // Uses the synthesized tool name + schema published by the proxy
+          // re-mapper. The proxy translates this into the upstream wrapper
+          // call (toolstem--toolstem-mcp-server with tool=get_stock_snapshot).
           const finance = await testEndpoint(
             FINANCE_URL,
             "get_stock_snapshot",
-            { ticker: "AAPL" },
+            { symbol: "AAPL" },
             "FINANCE"
           );
 
           // --- SEC call ---
+          // Synthesized SEC tool name is `get_insider_signal` (singular) and
+          // takes `ticker_or_cik`, not `ticker`.
           const sec = await testEndpoint(
             SEC_URL,
-            "get_insider_signals",
-            { ticker: "AAPL" },
+            "get_insider_signal",
+            { ticker_or_cik: "AAPL" },
             "SEC"
           );
 

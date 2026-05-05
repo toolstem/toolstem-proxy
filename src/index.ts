@@ -29,6 +29,15 @@ import {
 } from "@x402/extensions/bazaar";
 import { createFacilitatorConfig } from "@coinbase/x402";
 import { privateKeyToAccount } from "viem/accounts";
+import {
+  FINANCE_TOOLS,
+  SEC_TOOLS,
+  getToolsForRoute,
+  getUpstreamWrapperName,
+  validateToolArguments,
+  type RouteKey,
+  type ToolDef,
+} from "./tool-defs";
 
 type Bindings = {
   APIFY_TOKEN: string;
@@ -749,6 +758,223 @@ app.use("/mcp/*", async (c, next) => {
   }
 });
 
+// ── Tool re-mapper ──────────────────────────────────────────────────────────
+//
+// The upstream Apify MCP gateway exposes each Toolstem actor as a SINGLE tool
+// (e.g. `toolstem--toolstem-mcp-server`) with the inner tool selection hidden
+// behind a `tool` enum parameter. That contradicts our public docs, README,
+// and HN announcement, which describe a 3-tool / 5-tool surface. The
+// re-mapper makes the on-the-wire surface match the marketing:
+//
+//   * `tools/list` responses are intercepted: the wrapper entry is replaced
+//     with the synthesized 3 (Finance) / 5 (SEC) tool definitions, and
+//     Apify's internal `get-actor-output` tool is dropped.
+//   * `tools/call` requests are translated before forwarding upstream:
+//       inbound  { name: "get_stock_snapshot", arguments: { symbol: "AAPL" } }
+//       upstream { name: "toolstem--toolstem-mcp-server",
+//                  arguments: { tool: "get_stock_snapshot", symbol: "AAPL" } }
+//     Inbound arguments are validated against the synthesized inputSchema
+//     before the upstream call so we get per-tool validation that the
+//     wrapper does not provide.
+//
+// Wallet, pricing, and the x402 payment flow are unchanged. The translation
+// only kicks in on /mcp/finance and /mcp/sec, and only for tools/list and
+// tools/call (every other JSON-RPC method passes through untouched).
+
+const FINANCE_TOOL_NAMES = new Set(FINANCE_TOOLS.map((t) => t.name));
+const SEC_TOOL_NAMES = new Set(SEC_TOOLS.map((t) => t.name));
+
+function routeForPath(path: string): RouteKey | null {
+  if (path === "/mcp/finance") return "finance";
+  if (path === "/mcp/sec") return "sec";
+  return null;
+}
+
+type JsonRpcRequest = {
+  jsonrpc?: unknown;
+  id?: unknown;
+  method?: unknown;
+  params?: Record<string, unknown> | undefined;
+};
+
+function jsonRpcError(
+  id: unknown,
+  code: number,
+  message: string,
+  data?: unknown,
+): Response {
+  const body: Record<string, unknown> = {
+    jsonrpc: "2.0",
+    id: id ?? null,
+    error: { code, message },
+  };
+  if (data !== undefined) {
+    (body.error as Record<string, unknown>).data = data;
+  }
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/**
+ * Rewrite the inbound JSON-RPC body for a `tools/call` so that the upstream
+ * Apify wrapper receives the wrapped form. Returns either the rewritten
+ * body string OR a Response to short-circuit (validation failure / unknown
+ * tool / malformed params).
+ */
+function translateToolsCall(
+  parsed: JsonRpcRequest,
+  route: RouteKey,
+): { body: string } | { response: Response } {
+  const params = parsed.params;
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    return {
+      response: jsonRpcError(parsed.id, -32602, "Invalid params: expected object"),
+    };
+  }
+  const name = (params as { name?: unknown }).name;
+  if (typeof name !== "string") {
+    return {
+      response: jsonRpcError(parsed.id, -32602, "Invalid params: name must be a string"),
+    };
+  }
+  const validNames = route === "finance" ? FINANCE_TOOL_NAMES : SEC_TOOL_NAMES;
+  if (!validNames.has(name)) {
+    return {
+      response: jsonRpcError(
+        parsed.id,
+        -32601,
+        `Unknown tool: ${name}`,
+        {
+          available: Array.from(validNames),
+        },
+      ),
+    };
+  }
+  const toolDef = getToolsForRoute(route).find((t) => t.name === name) as ToolDef;
+  const rawArgs = (params as { arguments?: unknown }).arguments ?? {};
+  const validationError = validateToolArguments(toolDef, rawArgs);
+  if (validationError) {
+    return {
+      response: jsonRpcError(
+        parsed.id,
+        -32602,
+        `Invalid arguments for ${name}: ${validationError}`,
+      ),
+    };
+  }
+  const wrapperName = getUpstreamWrapperName(route);
+  const inboundArgs = rawArgs as Record<string, unknown>;
+  const upstreamArgs: Record<string, unknown> = {
+    tool: name,
+    ...inboundArgs,
+  };
+  const rewritten = {
+    ...parsed,
+    params: {
+      ...params,
+      name: wrapperName,
+      arguments: upstreamArgs,
+    },
+  };
+  return { body: JSON.stringify(rewritten) };
+}
+
+/**
+ * SSE frames are `event: <name>\n` followed by one or more `data: <line>\n`
+ * lines and an empty line terminator. We only need to rewrite the `data:`
+ * payload of frames that contain a JSON-RPC `tools/list` result; everything
+ * else is passed through verbatim.
+ */
+function rewriteToolsListInBody(
+  bodyText: string,
+  route: RouteKey,
+): string {
+  const trimmed = bodyText.trimStart();
+  if (trimmed.startsWith("{")) {
+    // Plain JSON response (server collapsed the SSE envelope).
+    try {
+      const parsed = JSON.parse(bodyText);
+      const out = rewriteToolsListJson(parsed, route);
+      return out !== null ? JSON.stringify(out) : bodyText;
+    } catch {
+      return bodyText;
+    }
+  }
+  // Otherwise treat as SSE — split on blank-line frame terminators while
+  // preserving newlines inside data lines. We re-emit each frame; only frames
+  // whose data parses as a tools/list JSON-RPC response get rewritten.
+  const frames = bodyText.split(/\r?\n\r?\n/);
+  const out: string[] = [];
+  for (const frame of frames) {
+    if (!frame.trim()) {
+      out.push(frame);
+      continue;
+    }
+    const lines = frame.split(/\r?\n/);
+    const dataLines: string[] = [];
+    const otherLines: string[] = [];
+    for (const line of lines) {
+      if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).replace(/^ /, ""));
+      } else {
+        otherLines.push(line);
+      }
+    }
+    if (dataLines.length === 0) {
+      out.push(frame);
+      continue;
+    }
+    const joined = dataLines.join("\n");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(joined);
+    } catch {
+      out.push(frame);
+      continue;
+    }
+    const rewritten = rewriteToolsListJson(parsed, route);
+    if (rewritten === null) {
+      out.push(frame);
+      continue;
+    }
+    const newData = JSON.stringify(rewritten);
+    const rebuilt = [...otherLines, ...newData.split("\n").map((l) => `data: ${l}`)]
+      .join("\n");
+    out.push(rebuilt);
+  }
+  return out.join("\n\n");
+}
+
+/**
+ * If `parsed` looks like a tools/list JSON-RPC response, return a new value
+ * with the synthesized tools array. Otherwise return null (caller leaves the
+ * frame alone).
+ */
+function rewriteToolsListJson(parsed: unknown, route: RouteKey): unknown | null {
+  if (!parsed || typeof parsed !== "object") return null;
+  const obj = parsed as Record<string, unknown>;
+  const result = obj.result;
+  if (!result || typeof result !== "object") return null;
+  const tools = (result as { tools?: unknown }).tools;
+  if (!Array.isArray(tools)) return null;
+  const synthesized = getToolsForRoute(route).map((t) => ({
+    name: t.name,
+    title: t.title,
+    description: t.description,
+    inputSchema: t.inputSchema,
+    annotations: t.annotations,
+  }));
+  return {
+    ...obj,
+    result: {
+      ...(result as Record<string, unknown>),
+      tools: synthesized,
+    },
+  };
+}
+
 // ── Apify MCP gateway proxy ─────────────────────────────────────────────────
 
 async function proxyToApify(
@@ -805,19 +1031,73 @@ async function proxyToApify(
   });
 }
 
+/**
+ * Wrapper that performs request/response translation around proxyToApify.
+ * On the request side: detect tools/call, validate, and rewrite the body.
+ * On the response side: detect tools/list and replace the wrapper tool entry
+ * with the synthesized tool definitions. Streaming SSE responses are
+ * buffered and rewritten — buffering is fine here because tools/list
+ * responses are small.
+ */
+async function proxyWithRemap(
+  request: Request,
+  env: Bindings,
+  route: RouteKey,
+  actor: string,
+  prebufferedBody?: string,
+): Promise<Response> {
+  // Read the body once. For free methods the discovery middleware already
+  // consumed the stream into prebufferedBody; for paid methods we must read
+  // here (the x402 middleware preserves the body).
+  const inboundBody = prebufferedBody ?? (await request.text());
+
+  let parsed: JsonRpcRequest | undefined;
+  try {
+    parsed = inboundBody ? (JSON.parse(inboundBody) as JsonRpcRequest) : undefined;
+  } catch {
+    parsed = undefined;
+  }
+
+  let upstreamBody = inboundBody;
+  const method = parsed?.method;
+  const isToolsCall = method === "tools/call";
+  const isToolsList = method === "tools/list";
+
+  if (isToolsCall && parsed) {
+    const out = translateToolsCall(parsed, route);
+    if ("response" in out) return out.response;
+    upstreamBody = out.body;
+  }
+
+  const upstreamRes = await proxyToApify(request, env, actor, upstreamBody);
+
+  if (!isToolsList) return upstreamRes;
+  if (upstreamRes.status !== 200) return upstreamRes;
+
+  // Buffer & rewrite. Preserve all headers so MCP session continuity works.
+  const text = await upstreamRes.text();
+  const rewritten = rewriteToolsListInBody(text, route);
+  const newHeaders = new Headers(upstreamRes.headers);
+  newHeaders.delete("content-length");
+  return new Response(rewritten, {
+    status: upstreamRes.status,
+    headers: newHeaders,
+  });
+}
+
 app.post("/mcp/finance", async (c) =>
-  proxyToApify(c.req.raw, c.env, c.env.DEFAULT_ACTOR, c.get("mcpFreeBody")),
+  proxyWithRemap(c.req.raw, c.env, "finance", c.env.DEFAULT_ACTOR, c.get("mcpFreeBody")),
 );
 
 app.post("/mcp/sec", async (c) =>
-  proxyToApify(c.req.raw, c.env, c.env.SEC_ACTOR, c.get("mcpFreeBody")),
+  proxyWithRemap(c.req.raw, c.env, "sec", c.env.SEC_ACTOR, c.get("mcpFreeBody")),
 );
 
 // GET on the MCP routes returns a small discovery hint instead of a 404.
 // Useful for humans / agents that probe the URL with a browser to figure out
 // what the endpoint expects. Streamable HTTP MCP is POST-only, so this is
 // purely informational.
-function buildDiscoveryHint(name: string, slug: string) {
+function buildDiscoveryHint(name: string, slug: string, route: RouteKey) {
   return {
     server: name,
     protocol: "mcp",
@@ -835,15 +1115,16 @@ function buildDiscoveryHint(name: string, slug: string) {
       "notifications/*",
     ],
     paid_methods: ["tools/call", "prompts/get", "resources/read"],
+    tools: getToolsForRoute(route).map((t) => t.name),
   };
 }
 
 app.get("/mcp/finance", (c) =>
-  c.json(buildDiscoveryHint("toolstem-finance", "finance")),
+  c.json(buildDiscoveryHint("toolstem-finance", "finance", "finance")),
 );
 
 app.get("/mcp/sec", (c) =>
-  c.json(buildDiscoveryHint("toolstem-sec", "sec")),
+  c.json(buildDiscoveryHint("toolstem-sec", "sec", "sec")),
 );
 
 // ── 404 ─────────────────────────────────────────────────────────────────────

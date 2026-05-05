@@ -1094,6 +1094,25 @@ async function proxyWithRemap(
   const method = parsed?.method;
   const isToolsCall = method === "tools/call";
   const isToolsList = method === "tools/list";
+  const isPromptsList = method === "prompts/list";
+
+  // Short-circuit prompts/list: Toolstem exposes no prompts.  The upstream
+  // Apify wrapper leaks a generic "GetLatestNewsOnTopic" prompt that has
+  // nothing to do with our tools.  Return an empty array without calling
+  // upstream — keeps the surface honest and avoids confusing MCP clients.
+  if (isPromptsList && parsed) {
+    return new Response(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: parsed.id ?? null,
+        result: { prompts: [] },
+      }),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      },
+    );
+  }
 
   if (isToolsCall && parsed) {
     const out = translateToolsCall(parsed, route);

@@ -49,7 +49,7 @@ async function main() {
       id: 1,
       params: {
         name: "get_stock_snapshot",
-        arguments: { ticker: "AAPL" },
+        arguments: { symbol: "AAPL" },
       },
     }),
   });

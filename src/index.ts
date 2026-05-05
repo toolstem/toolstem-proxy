@@ -38,6 +38,7 @@ import {
   type RouteKey,
   type ToolDef,
 } from "./tool-defs";
+import { playground, isAllowedPlaygroundOrigin } from "./playground";
 
 type Bindings = {
   APIFY_TOKEN: string;
@@ -90,6 +91,7 @@ app.get("/", (c) =>
     endpoints: {
       "/mcp/finance": "Toolstem Financial Intelligence — stock data, financials, peers",
       "/mcp/sec": "Toolstem SEC EDGAR Signal Intelligence — filings, insiders, 8-K severity",
+      "/playground": "Free walletless cached demo responses (AAPL/MSFT/GOOGL only)",
       "/health": "Liveness probe",
     },
     payment: {
@@ -108,11 +110,41 @@ app.get("/health", (c) => c.json({ ok: true, ts: Date.now() }));
 // from public/. We add a redirect from /test → /test.html for convenience.
 app.get("/test", (c) => c.redirect("/test.html", 302));
 
+// /playground/* uses a stricter CORS allowlist (marketing origins + localhost
+// + Claude Desktop). Apply before the wildcard CORS middleware below so
+// these routes don't end up with Access-Control-Allow-Origin: *.
+app.use("/playground/*", async (c, next) => {
+  const origin = c.req.header("Origin") ?? null;
+  const userAgent = c.req.header("User-Agent") ?? null;
+  const { allow, allowOrigin } = isAllowedPlaygroundOrigin(origin, userAgent);
+
+  if (c.req.method === "OPTIONS") {
+    if (!allow) return new Response(null, { status: 403 });
+    const headers: Record<string, string> = {
+      "Access-Control-Allow-Methods": "GET, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Accept",
+      "Access-Control-Max-Age": "86400",
+      Vary: "Origin",
+    };
+    if (allowOrigin) headers["Access-Control-Allow-Origin"] = allowOrigin;
+    return new Response(null, { status: 204, headers });
+  }
+
+  await next();
+  if (allowOrigin) {
+    c.header("Access-Control-Allow-Origin", allowOrigin);
+    c.header("Vary", "Origin");
+  }
+});
+app.route("/playground", playground);
+
 // CORS: required so the /test page can call /mcp/* from the same origin.
 // (Same-origin in our case since /test is served from mcp.toolstem.com too,
 // but we add headers anyway for any future cross-origin agent clients.)
 app.use("*", async (c, next) => {
   await next();
+  // Don't override the playground's own CORS headers.
+  if (c.req.path.startsWith("/playground")) return;
   c.header("Access-Control-Allow-Origin", "*");
   c.header(
     "Access-Control-Expose-Headers",

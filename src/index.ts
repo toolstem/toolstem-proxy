@@ -272,7 +272,7 @@ async function getPaymentMiddleware(env: Bindings) {
                 jsonrpc: "2.0",
                 id: 1,
                 method: "tools/call",
-                params: { name: "get_quote", arguments: { symbol: "AAPL" } },
+                params: { name: "get_stock_snapshot", arguments: { symbol: "AAPL" } },
               },
               inputSchema: {
                 properties: {
@@ -345,8 +345,8 @@ async function getPaymentMiddleware(env: Bindings) {
                 id: 1,
                 method: "tools/call",
                 params: {
-                  name: "get_recent_filings",
-                  arguments: { ticker: "AAPL", limit: 5 },
+                  name: "get_company_filings_summary",
+                  arguments: { ticker_or_cik: "AAPL" },
                 },
               },
               inputSchema: {
@@ -380,7 +380,7 @@ async function getPaymentMiddleware(env: Bindings) {
                     content: [
                       {
                         type: "text",
-                        text: '[{"form":"8-K","filedAt":"2026-05-01","severity":"low"}]',
+                        text: '{"ticker":"AAPL","filing_velocity":"NORMAL","material_events_90d":1,"recent_filings":[{"form":"8-K","filedAt":"2026-05-01"}]}',
                       },
                     ],
                   },

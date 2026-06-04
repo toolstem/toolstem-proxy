@@ -19,7 +19,7 @@
 import { Hono } from "hono";
 import { paymentMiddleware, x402ResourceServer } from "@x402/hono";
 import { ExactEvmScheme as ExactEvmServerScheme } from "@x402/evm/exact/server";
-import { HTTPFacilitatorClient } from "@x402/core/server";
+import { HTTPFacilitatorClient, type HTTPRequestContext } from "@x402/core/server";
 import {
   bazaarResourceServerExtension,
   declareDiscoveryExtension,
@@ -67,9 +67,11 @@ function buildFacilitatorClient(env: Bindings): HTTPFacilitatorClient {
 }
 
 type Variables = {
-  // Set by the /mcp/* middleware when a free discovery method bypasses
-  // payment, so the downstream proxy can read the already-consumed body.
-  mcpFreeBody?: string;
+  // Set by the /mcp/* middleware to the buffered POST body so the downstream
+  // proxy can read it without touching c.req.raw. This matters because the SEC
+  // dynamic-price function reads the body via c.req.json() (to price per tool),
+  // which consumes the raw stream — so the proxy must not re-read c.req.raw.
+  mcpBody?: string;
 };
 
 const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
@@ -152,6 +154,61 @@ app.use("*", async (c, next) => {
 app.options("*", (c) => new Response(null, { status: 204 }));
 
 // ── x402-protected MCP endpoints ────────────────────────────────────────────
+
+// SEC per-tool x402 price tiers. /mcp/sec quotes a different price depending on
+// which tool a `tools/call` invokes, instead of one flat price for all tools.
+// Keys MUST match SEC_TOOLS names in tool-defs.ts. (Finance stays flat $0.01.)
+const SEC_PRICE_TIERS: Record<string, string> = {
+  get_company_filings_summary: "$0.005",
+  get_insider_signal: "$0.05",
+  get_institutional_signal: "$0.05",
+  get_material_events_digest: "$0.50",
+  compare_disclosure_signals: "$0.50",
+};
+
+// Safest default for a `tools/call` whose tool name is missing/unknown/unparseable:
+// charge the LOWEST tier. Never free-pass (would let a $0.50 tool be invoked for
+// free) and never hard-error at the pricing stage (tool-name validation happens
+// later, after payment, in translateToolsCall). This is also the distinct lowest
+// value in SEC_PRICE_TIERS.
+const SEC_LOWEST_TIER = "$0.005";
+
+/**
+ * DynamicPrice for POST /mcp/sec. Resolved ONCE per request by the x402 core
+ * (server/index.ts `buildPaymentRequirementsFromOptions`), and the resulting
+ * requirement drives BOTH the 402 quote and the payment verification — so the
+ * amount an agent is told to pay is exactly the amount the facilitator checks.
+ * An agent that paid the $0.005 tier therefore cannot satisfy a $0.50 tool.
+ *
+ * Reads the JSON-RPC body via the adapter (Hono's getBody() → c.req.json(),
+ * which is cached, so it does not interfere with the downstream proxy that
+ * reads the prebuffered body). For method !== "tools/call" (e.g. a paid
+ * prompts/get) and for any missing/unknown tool name or batch array body, it
+ * falls back to the lowest tier.
+ */
+async function selectSecPrice(context: HTTPRequestContext): Promise<string> {
+  let body: unknown;
+  try {
+    body = await context.adapter.getBody?.();
+  } catch {
+    return SEC_LOWEST_TIER;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    // Missing body or a JSON-RPC batch (array): no single tool to price → lowest.
+    return SEC_LOWEST_TIER;
+  }
+  const { method, params } = body as {
+    method?: unknown;
+    params?: unknown;
+  };
+  if (method !== "tools/call") return SEC_LOWEST_TIER;
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    return SEC_LOWEST_TIER;
+  }
+  const name = (params as { name?: unknown }).name;
+  if (typeof name !== "string") return SEC_LOWEST_TIER;
+  return SEC_PRICE_TIERS[name] ?? SEC_LOWEST_TIER;
+}
 
 /**
  * Build the x402 middleware. We cache the constructed middleware per Worker
@@ -261,13 +318,16 @@ async function getPaymentMiddleware(env: Bindings) {
       "POST /mcp/sec": {
         accepts: {
           scheme: "exact",
-          price: "$0.01",
+          // Per-tool tiered pricing: resolved per request from the JSON-RPC
+          // body (params.name). The same resolved amount is used for the 402
+          // quote AND the facilitator verification. See selectSecPrice.
+          price: selectSecPrice,
           network,
           payTo: env.PAYTO_ADDRESS,
           maxTimeoutSeconds: 60,
         },
         description:
-          "Toolstem SEC EDGAR Signal Intelligence MCP — filings, insider transactions, 8-K severity scoring. One paid tool call.",
+          "Toolstem SEC EDGAR Signal Intelligence MCP — filings, insider transactions, 8-K severity scoring. Per-tool tiered pricing ($0.005–$0.50).",
         extensions: {
           bazaar: {
             name: "toolstem-sec",
@@ -368,13 +428,19 @@ app.use("/mcp/*", async (c, next) => {
   // entirely so the route handler (or CORS/notFound) can respond directly.
   if (c.req.method !== "POST") return next();
 
-  // Inspect the JSON-RPC body BEFORE running the paid middleware. Discovery
-  // methods skip payment entirely and proxy straight to the upstream MCP
-  // server. We buffer the body once and stash it on the context so the
-  // downstream proxy handler can re-read it without consuming the stream.
+  // Inspect the JSON-RPC body BEFORE running the paid middleware. We buffer the
+  // body once (via clone, so the original stream stays intact) and stash it on
+  // the context so the downstream proxy reads the buffered copy rather than
+  // re-consuming c.req.raw. This is required because the SEC route's
+  // dynamic-price function reads the body through c.req.json() to price per
+  // tool, which consumes the raw stream.
+  //
+  // Discovery methods (initialize, tools/list, ...) skip payment entirely and
+  // proxy straight to the upstream MCP server.
   try {
     const rawBody = await c.req.raw.clone().text();
     if (rawBody) {
+      c.set("mcpBody", rawBody);
       let parsed: unknown;
       try {
         parsed = JSON.parse(rawBody);
@@ -383,7 +449,6 @@ app.use("/mcp/*", async (c, next) => {
       }
       const method = (parsed as { method?: unknown } | undefined)?.method;
       if (isFreeMcpMethod(method)) {
-        c.set("mcpFreeBody", rawBody);
         return next();
       }
     }
@@ -784,11 +849,11 @@ async function proxyWithRemap(
 }
 
 app.post("/mcp/finance", async (c) =>
-  proxyWithRemap(c.req.raw, c.env, "finance", c.env.DEFAULT_ACTOR, c.get("mcpFreeBody")),
+  proxyWithRemap(c.req.raw, c.env, "finance", c.env.DEFAULT_ACTOR, c.get("mcpBody")),
 );
 
 app.post("/mcp/sec", async (c) =>
-  proxyWithRemap(c.req.raw, c.env, "sec", c.env.SEC_ACTOR, c.get("mcpFreeBody")),
+  proxyWithRemap(c.req.raw, c.env, "sec", c.env.SEC_ACTOR, c.get("mcpBody")),
 );
 
 // GET on the MCP routes returns a small discovery hint instead of a 404.
@@ -796,13 +861,26 @@ app.post("/mcp/sec", async (c) =>
 // what the endpoint expects. Streamable HTTP MCP is POST-only, so this is
 // purely informational.
 function buildDiscoveryHint(name: string, slug: string, route: RouteKey) {
+  // Finance is flat-priced; SEC is tiered per tool. Surface the actual shape so
+  // discovery clients don't see a stale flat figure for SEC.
+  const pricing =
+    route === "sec"
+      ? {
+          // USD price per tool, on Base mainnet via x402. Derived from the same
+          // SEC_PRICE_TIERS map that the paywall quotes/verifies against.
+          price_model: "tiered-per-tool",
+          price_range: "$0.005–$0.50 USDC on Base",
+          price_per_tool: { ...SEC_PRICE_TIERS },
+          unknown_tool_price: SEC_LOWEST_TIER,
+        }
+      : { price_per_call: "0.01 USDC on Base" };
   return {
     server: name,
     protocol: "mcp",
     version: "2024-11-05",
     transport: "streamable-http",
     payment: "x402",
-    price_per_call: "0.01 USDC on Base",
+    ...pricing,
     docs: `https://toolstem.com/${slug}/`,
     initialize: "POST with JSON-RPC 2.0 method=initialize",
     free_methods: [

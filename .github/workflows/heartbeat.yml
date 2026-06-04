@@ -1,0 +1,49 @@
+name: Heartbeat
+
+# Keeps the Coinbase x402 Bazaar listing alive by making periodic genuine paid
+# mainnet /verify calls (see heartbeat/heartbeat.ts). The Bazaar ages a resource
+# out unless the CDP facilitator keeps observing fresh authenticated mainnet
+# verifies, so this runs on a schedule.
+#
+# The heartbeat wallet needs a small amount of ETH on Base for L2 gas plus a few
+# cents of USDC per run. The run step logs the wallet's public address
+# (payer=0x...) at startup so the owner can fund it after the first run.
+
+on:
+  schedule:
+    # Every 6 hours.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run heartbeat
+        # Do not hard-fail the scheduled job: the heartbeat exits non-zero on any
+        # failed verify (or if the wallet is unfunded / key missing). We want the
+        # log captured and the cron to stay green so a transient failure does not
+        # spam failure notifications. Inspect the step log for OK/FAIL details.
+        continue-on-error: true
+        env:
+          HEARTBEAT_WALLET_PRIVATE_KEY: ${{ secrets.HEARTBEAT_WALLET_PRIVATE_KEY }}
+          # Optional per-call safety cap (USD). Omit to use the script default ($0.02).
+          HEARTBEAT_MAX_PAYMENT_USD: ${{ vars.HEARTBEAT_MAX_PAYMENT_USD }}
+        run: |
+          echo "payTo (resource recipient): 0xB009DA692cF3EFF7567bF727b8B2F3b5BFc3383E"
+          echo "The heartbeat wallet's public address is logged below as payer=0x..."
+          echo "Fund that address with a little ETH on Base (gas) + a few cents USDC."
+          echo "----------------------------------------------------------------------"
+          npx tsx heartbeat/heartbeat.ts

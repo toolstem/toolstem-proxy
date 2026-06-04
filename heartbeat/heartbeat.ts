@@ -29,9 +29,12 @@
  * ------
  * - The wallet key and (optional) CDP creds come ONLY from env vars, by name.
  *   Nothing is hardcoded, printed, or committed.
- * - A `maxPaymentUsd` cap (default $0.05) is enforced as a payment policy: any
+ * - A `maxPaymentUsd` cap (default $0.02) is enforced as a payment policy: any
  *   quoted requirement above the cap is filtered out and the call aborts rather
  *   than paying. The two heartbeat tools are the cheapest tiers, well under it.
+ * - Payments are pinned to Base mainnet (eip155:8453): the scheme is registered
+ *   only for mainnet and a network policy + an explicit pre-payment assertion
+ *   reject any non-mainnet (e.g. testnet) quote, failing closed.
  * - If required env vars are missing, the job exits cleanly WITHOUT attempting
  *   any network/payment call.
  * - Logs are non-sensitive only: resource, ok/fail, amount, and tx hash if the
@@ -55,7 +58,11 @@ const NETWORK = "eip155:8453"; // Base MAINNET. Sepolia (84532) does NOT feed th
 const FINANCE_URL = "https://mcp.toolstem.com/mcp/finance";
 const SEC_URL = "https://mcp.toolstem.com/mcp/sec";
 
-const DEFAULT_MAX_PAYMENT_USD = 0.05;
+// Default per-call cap. Clears the two intended tiers ($0.01 Finance, $0.005
+// SEC) with margin, but fails closed against any standard ($0.05) or premium
+// ($0.50) tool so a misconfig/mis-quote can never pay a pricier tool. Operators
+// can still raise it via HEARTBEAT_MAX_PAYMENT_USD if ever needed.
+const DEFAULT_MAX_PAYMENT_USD = 0.02;
 
 interface HeartbeatTarget {
   label: string;
@@ -120,7 +127,19 @@ const account = privateKeyToAccount(pk);
 
 function buildPayingFetch(): typeof fetch {
   const core = new x402Client();
-  registerExactEvmScheme(core, { signer: account });
+  // Pin the scheme to Base mainnet only. With `networks` set, the client
+  // registers the exact-EVM scheme solely for eip155:8453 — any quote on a
+  // different network (e.g. a testnet) has no registered scheme and is rejected
+  // before a payment can be built.
+  registerExactEvmScheme(core, { signer: account, networks: [NETWORK] });
+
+  // Defense in depth: drop any quoted requirement whose network is not mainnet.
+  // If the server ever mis-declares (or offers multiple networks), anything
+  // non-eip155:8453 is filtered out here. If that empties the list the client
+  // throws and the call fails closed — no non-mainnet payment is ever signed.
+  core.registerPolicy((_version, reqs) =>
+    reqs.filter((r) => r.network === NETWORK)
+  );
 
   // Safety cap: drop any quoted requirement above maxAtomic. If everything is
   // filtered out, the client cannot construct a payment and the call fails
@@ -152,6 +171,25 @@ function buildPayingFetch(): typeof fetch {
     }
 
     const paymentRequired = http.getPaymentRequiredResponse(getHeader, bodyForV1);
+
+    // Explicit mainnet assertion BEFORE any payment is built: every quoted
+    // requirement in the challenge must be on Base mainnet. If the server
+    // declares anything else, abort without paying. This is redundant with the
+    // network policy above but gives a clear, early failure reason.
+    const accepts = (paymentRequired as { accepts?: Array<{ network?: string }> })
+      .accepts;
+    if (
+      Array.isArray(accepts) &&
+      accepts.length > 0 &&
+      !accepts.some((a) => a.network === NETWORK)
+    ) {
+      throw new Error(
+        `non-mainnet network: challenge offered ${JSON.stringify(
+          accepts.map((a) => a.network)
+        )}, expected ${NETWORK}`
+      );
+    }
+
     const paymentPayload = await http.createPaymentPayload(paymentRequired);
     const paymentHeaders = http.encodePaymentSignatureHeader(paymentPayload);
 

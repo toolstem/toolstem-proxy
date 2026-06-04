@@ -45,7 +45,7 @@ filled-in `.env`.** See [`.env.example`](./.env.example).
 | Var | Required | Purpose |
 |-----|----------|---------|
 | `HEARTBEAT_WALLET_PRIVATE_KEY` | **Yes** | Funded Base **mainnet** wallet private key (`0x`-prefixed). Signs the USDC payments. The script reads this by name only; it is never printed or logged. |
-| `HEARTBEAT_MAX_PAYMENT_USD` | No (default `0.05`) | Hard per-call safety cap. Any quoted requirement above this is filtered out and the call aborts rather than overpaying. |
+| `HEARTBEAT_MAX_PAYMENT_USD` | No (default `0.02`) | Hard per-call safety cap. Clears the two intended tiers ($0.01 + $0.005) with margin but stays below any standard ($0.05) or premium ($0.50) tool, so a mis-quote can never overpay. Any quoted requirement above this is filtered out and the call aborts. |
 
 **Not read by this script** (documented for the operator): `CDP_API_KEY_ID` and
 `CDP_API_KEY_SECRET` are the **Worker's** secrets used by the deployed
@@ -132,5 +132,9 @@ successful run they should reappear.
   hardcoded, printed, or committed.
 - The `maxPaymentUsd` cap fails **closed**: if a quote ever exceeds the cap, the
   client can't build a payment and the call errors instead of overpaying.
+- Payments are **pinned to Base mainnet** (`eip155:8453`): the scheme is
+  registered only for mainnet, a network policy drops any non-mainnet quote, and
+  an explicit pre-payment assertion aborts a target if the challenge offers a
+  non-mainnet network — so a testnet quote can never be paid.
 - Idempotent and safe to run on a schedule — each run is an independent set of
   one-shot paid calls with no shared state.

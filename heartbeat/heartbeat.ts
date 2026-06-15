@@ -222,6 +222,73 @@ function findTxHash(headers: Headers, body: string): string | undefined {
   return m ? m[0] : undefined;
 }
 
+// ---- MCP Streamable HTTP session handshake ----
+
+// The MCP Streamable HTTP transport requires an `initialize` handshake before
+// any `tools/call`: the server issues a session id in the `mcp-session-id`
+// response header, and every subsequent request on that session must echo it
+// back. Without it the server replies 400 "No valid session ID provided or not
+// initialization request". `initialize` and the follow-up `notifications/
+// initialized` are free (no x402 paywall), so this uses a plain fetch — the
+// paid request is the `tools/call` only.
+//
+// Streamable HTTP also requires the client to advertise both JSON and SSE in
+// the Accept header; the server may answer either content type.
+const MCP_ACCEPT = "application/json, text/event-stream";
+const MCP_PROTOCOL_VERSION = "2024-11-05";
+
+async function initSession(url: string): Promise<string> {
+  const res = await globalThis.fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: MCP_ACCEPT,
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: MCP_PROTOCOL_VERSION,
+        capabilities: {},
+        clientInfo: { name: "heartbeat", version: "1.0" },
+      },
+    }),
+  });
+
+  const sessionId = res.headers.get("mcp-session-id");
+  if (!res.ok || !sessionId) {
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `initialize failed status=${res.status} sessionId=${JSON.stringify(
+        sessionId
+      )} bodyHead=${JSON.stringify(body.slice(0, 200))}`
+    );
+  }
+  // Drain the initialize response body so the connection can be reused.
+  await res.text().catch(() => undefined);
+
+  // Per the MCP lifecycle, acknowledge initialization. This is a notification
+  // (no `id`, no response expected) and must carry the session id.
+  await globalThis
+    .fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: MCP_ACCEPT,
+        "mcp-session-id": sessionId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "notifications/initialized",
+      }),
+    })
+    .then((r) => r.text().catch(() => undefined))
+    .catch(() => undefined);
+
+  return sessionId;
+}
+
 // ---- Run one paid call against a single target ----
 
 async function runTarget(
@@ -230,12 +297,22 @@ async function runTarget(
 ): Promise<boolean> {
   const startedAt = Date.now();
   try {
+    // 1. Free MCP handshake to obtain a session id (no payment involved).
+    const sessionId = await initSession(t.url);
+
+    // 2. Paid tool call on the established session. The x402 paywall fires here:
+    //    payingFetch transparently handles the 402 -> sign payment -> retry,
+    //    and the session id is preserved across the retry via the request init.
     const res = await payingFetch(t.url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Accept: MCP_ACCEPT,
+        "mcp-session-id": sessionId,
+      },
       body: JSON.stringify({
         jsonrpc: "2.0",
-        id: 1,
+        id: 2,
         method: "tools/call",
         params: { name: t.toolName, arguments: t.args },
       }),
